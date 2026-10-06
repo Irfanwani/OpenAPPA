@@ -73,6 +73,7 @@ fn error_class(error: &EventError) -> &'static str {
         EventError::AnnotationRefused { .. } => "annotation_refused",
         EventError::UndeclaredTool { .. } => "undeclared_tool",
         EventError::UndeclaredSpawn { .. } => "undeclared_spawn",
+        EventError::PeerMessageTooLarge { .. } => "peer_message",
         EventError::MalformedPrincipal(_) | EventError::PrincipalMismatch => "principal",
         EventError::CallOutstanding
         | EventError::SpawnOutstanding
@@ -80,7 +81,7 @@ fn error_class(error: &EventError) -> &'static str {
         | EventError::ChildDispatchOpen => "outstanding_call",
         EventError::CallIdReused => "call_id_reused",
         EventError::TrajectoryEnded => "trajectory_ended",
-        EventError::UnknownTrajectory | EventError::TrajectoryExists => "trajectory",
+        EventError::UnknownTrajectory | EventError::TrajectoryExists | EventError::RootArchived => "trajectory",
         EventError::UnknownDispatch | EventError::OutcomeMismatch => "dispatch",
         EventError::UnknownOffer | EventError::RemedyArguments { .. } => "remedy",
         EventError::NotAChild

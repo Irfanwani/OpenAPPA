@@ -4,7 +4,7 @@ name = "appa"
 
 [packages.battery.archestra]
 path = "batteries/archestra"
-digest = "sha256:451d4ebfc2d15bb16fa161a6f644d99cd5059ada6023c4b384771bd3fb52462e"
+digest = "sha256:abc2c8e9ba1a366da90b11db7274399433b83989e9385601906e9fa8b4fc0d44"
 
 [packages.battery.claude-code]
 path = "batteries/claude-code"
@@ -80,8 +80,8 @@ digest = "sha256:45207ffa0dc12294a04520d37cdc9a2a68bcc285a8d6046d1b1cd63738cba7c
 
 [packages.plugin.claude-code]
 path = "plugins/claude-code"
-digest = "sha256:e2e8f374a6013318ceb5104b11644f00f234220374ba67cec5247dbe5d407f57"
+digest = "sha256:626ab9b1828486d2a468f5aaf15ac119a4f17ca0673b7d7d6b0a3ba94a843f87"
 
 [packages.plugin.kagent]
 path = "plugins/kagent"
-digest = "sha256:32d0657aef421fde5ebdd5d9bd9c79b432517adb42c059e111eec74dfa6becee"
+digest = "sha256:4eff0459b00139ff41c1b09f8b105ea9aebbc57d49c9214135e0ecaace5587fd"

@@ -92,10 +92,7 @@ fn open_under(adapter: Adapter) -> Result<Runtime, OpenError> {
             policy: BATTERY,
             token_env: &[],
         }],
-        HostDefaults {
-            consult_timeout: Duration::from_millis(5000),
-            max_body_bytes: 65_536,
-        },
+        HostDefaults::new(Duration::from_millis(5000), 65_536),
         |_| None,
     )
     .expect("the hosted document composes");
@@ -145,6 +142,8 @@ async fn a_battery_rule_reaches_the_server_the_host_aliased_and_speaks_its_spell
             HookEvent::SessionStart {
                 root: actor.root.clone(),
                 principal: None,
+                address: None,
+                title: None,
             }
         )
         .await,

@@ -110,7 +110,9 @@ async fn open_runtime(dir: &tempfile::TempDir, config_toml: &str) -> Arc<Runtime
             &runtime,
             HookEvent::SessionStart {
                 root: root(),
-                principal: None
+                principal: None,
+                address: None,
+                title: None,
             }
         )
         .await,
@@ -471,7 +473,9 @@ async fn every_context_provider_is_asked_first_and_one_that_fails_leaves_an_erro
             &runtime,
             HookEvent::SessionStart {
                 root: root(),
-                principal: None
+                principal: None,
+                address: None,
+                title: None,
             }
         )
         .await,
@@ -702,7 +706,9 @@ async fn concurrent_claude_consults_are_gated_by_the_runtime_permit_pool() {
                 &runtime,
                 HookEvent::SessionStart {
                     root: root.clone(),
-                    principal: None
+                    principal: None,
+                    address: None,
+                    title: None,
                 }
             )
             .await,
@@ -1479,15 +1485,8 @@ url = "{url}"
 {token}"#
     );
     let host = |var: &str| (var == "APPA_TEST_TENANT_TOKEN").then(|| "tenant-secret".to_string());
-    Config::hosted(
-        &document,
-        HostDefaults {
-            consult_timeout: Duration::from_secs(2),
-            max_body_bytes: 65_536,
-        },
-        host,
-    )
-    .expect("the hosted document validates")
+    Config::hosted(&document, HostDefaults::new(Duration::from_secs(2), 65_536), host)
+        .expect("the hosted document validates")
 }
 
 async fn open_hosted(config: Config) -> Arc<Runtime> {
@@ -1499,7 +1498,9 @@ async fn open_hosted(config: Config) -> Arc<Runtime> {
             &runtime,
             HookEvent::SessionStart {
                 root: root(),
-                principal: None
+                principal: None,
+                address: None,
+                title: None,
             }
         )
         .await,
@@ -1647,10 +1648,7 @@ token_env = "APPA_PROVIDER_JEV_API_KEY"
 "#;
     let config = Config::hosted(
         document,
-        HostDefaults {
-            consult_timeout: Duration::from_secs(5),
-            max_body_bytes: 65_536,
-        },
+        HostDefaults::new(Duration::from_secs(5), 65_536),
         move |var| (var == "APPA_PROVIDER_JEV_API_KEY").then(|| key.to_string()),
     )
     .expect("the hosted document validates");

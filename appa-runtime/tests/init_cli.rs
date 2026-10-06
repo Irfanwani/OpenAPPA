@@ -247,10 +247,7 @@ fn a_first_activation_writes_the_profile_and_arms_the_launcher() {
     let clappa_settings: serde_json::Value =
         serde_json::from_slice(&fs::read(fixture.data.join("clappa.settings.json")).expect("clappa's settings"))
             .expect("clappa's settings are JSON");
-    assert_eq!(
-        clappa_settings["permissions"]["deny"],
-        serde_json::json!(["SendMessage"])
-    );
+    assert!(clappa_settings.get("permissions").is_none());
     assert!(fixture.settings_value().get("permissions").is_none());
     let statusline = clappa_settings["statusLine"]["command"]
         .as_str()
@@ -268,8 +265,9 @@ fn a_first_activation_writes_the_profile_and_arms_the_launcher() {
     assert_eq!(
         fs::read_to_string(fixture.skill()).expect("the skill is written"),
         format!(
-            "{}\n\n{}",
+            "{}\n\n{}\n\n{}",
             fs::read_to_string(guide.join("SKILL.md")).unwrap(),
+            fs::read_to_string(guide.join("references/core.md")).unwrap(),
             fs::read_to_string(guide.join("references/claude-code.md")).unwrap()
         )
     );

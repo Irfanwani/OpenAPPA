@@ -197,14 +197,9 @@ impl SessionInner {
         document.insert("externals".to_string(), toml::Value::Table(externals));
         let rendered = toml::to_string(&toml::Value::Table(document))
             .map_err(|error| format!("the composed policy does not render: {error}"))?;
-        let config = Config::hosted(
-            &rendered,
-            HostDefaults {
-                consult_timeout: CONSULT_TIMEOUT,
-                max_body_bytes: MAX_BODY_BYTES,
-            },
-            |var| std::env::var(var).ok(),
-        )
+        let config = Config::hosted(&rendered, HostDefaults::new(CONSULT_TIMEOUT, MAX_BODY_BYTES), |var| {
+            std::env::var(var).ok()
+        })
         .map_err(|error| error.to_string())?;
         let runtime = Runtime::open(config, store.path().join("appa.db"), None).map_err(|error| error.to_string())?;
 
@@ -225,11 +220,15 @@ impl SessionInner {
         inner.event(HookEvent::SessionStart {
             root: trajectory,
             principal: None,
+            address: None,
+            title: None,
         })?;
         inner.event(HookEvent::Prompt {
             actor: inner.actor(None),
             text: user_prompt.to_string(),
             settles: None,
+            peer: None,
+            title: None,
         })?;
         Ok(inner)
     }

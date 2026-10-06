@@ -29,7 +29,9 @@
 //!   authoritative `RootBound` workspace event;
 //! - operations and processed results — typed receipts for idempotent claims. They are not
 //!   engine facts. SQLite and Memory keep them beside the log; PostgreSQL hosts install the
-//!   equivalent `openappa_*` tables through their own migrations.
+//!   equivalent `openappa_*` tables through their own migrations;
+//! - held peer messages — a message body one root holds for another until the receiver takes
+//!   it. The body lives only there, never in the log.
 //!
 //! ### Storage Backend Scope & Retention
 //!
@@ -57,17 +59,20 @@
 //! log is next read, not here: serialization removes the in-process seal, and
 //! re-validation on read is the gate.
 
-use std::path::PathBuf;
-use std::time::SystemTime;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 pub use appa_engine::fact::Fact;
+use appa_engine::label::Label;
 use appa_engine::profile::PolicyFileKey;
 use appa_engine::value::DispatchId;
 pub use appa_engine::value::TrajectoryId;
-use appa_runtime_api::{AdapterName, Ruling, inventory::ToolInventory};
+use appa_runtime_api::{AdapterName, PeerAddress, PeerDigest, Ruling, SessionTitle, inventory::ToolInventory};
 
+pub mod embedded;
 mod encoding;
 pub mod files;
+mod held;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod receipts;
@@ -76,6 +81,8 @@ mod sqlite;
 use encoding::encode;
 use sqlite::Sqlite;
 
+use embedded::{DirectTake, EmbeddedClaim, EmbeddedError, EmbeddedRow, ReadTake};
+pub use held::{HeldError, HeldNotice, HeldPeerId, HeldPeerMessage};
 pub use receipts::{
     OperationClaim, OperationKey, OperationRequest, ProcessedResultClaim, ProcessedResultKey, ProcessedResultRequest,
     ReceiptBinding, ReceiptError, SessionScope,
@@ -190,23 +197,55 @@ pub enum HostObservation {
     PromptSettled { actor: HostActor },
     /// This actor's turn ended: its prompt mark and every vouch it still held are over.
     TurnEnded { actor: HostActor },
+    /// This root receives peer messages at `address`.
+    Addressed { address: PeerAddress },
+    /// This root's host shows it under `title`.
+    Titled { title: SessionTitle },
+    /// This root sent the peer message whose body digests to `digest`, carrying `label`, from
+    /// the dispatch the send ran under.
+    PeerSent {
+        digest: PeerDigest,
+        label: Label,
+        dispatch: DispatchId,
+    },
+    /// This root admitted the peer message whose body digests to `digest`.
+    PeerAdmitted { digest: PeerDigest },
 }
 
 impl HostObservation {
     /// The key this observation names, where it names one: a standing taken, held, or spent.
     /// The store writes it beside the record so [`LogStore::roots_mentioning`] can find the
     /// families that recorded it.
-    pub fn key(&self) -> Option<&str> {
+    pub fn key(&self) -> Option<String> {
         match self {
-            Self::Vouched { key, .. } | Self::Claimed { key, .. } | Self::Released { key, .. } => Some(key),
+            Self::Vouched { key, .. } | Self::Claimed { key, .. } | Self::Released { key, .. } => Some(key.clone()),
+            Self::Addressed { address } => Some(peer_address_key(address)),
+            Self::Titled { title } => Some(peer_title_key(title)),
+            Self::PeerSent { digest, .. } => Some(peer_sent_key(digest)),
             Self::Inventory { .. }
             | Self::CallBound { .. }
             | Self::CallSettled { .. }
             | Self::PromptSeen { .. }
             | Self::PromptSettled { .. }
-            | Self::TurnEnded { .. } => None,
+            | Self::TurnEnded { .. }
+            | Self::PeerAdmitted { .. } => None,
         }
     }
+}
+
+/// The key a [`HostObservation::Addressed`] record names, for [`LogStore::roots_mentioning`].
+pub fn peer_address_key(address: &PeerAddress) -> String {
+    format!("peer-address:{address}")
+}
+
+/// The key a [`HostObservation::Titled`] record names.
+pub fn peer_title_key(title: &SessionTitle) -> String {
+    format!("peer-title:{title}")
+}
+
+/// The key a [`HostObservation::PeerSent`] record names.
+pub fn peer_sent_key(digest: &PeerDigest) -> String {
+    format!("peer-sent:{digest}")
 }
 
 /// Whose observation this is: the family's root, and the child where the harness named one.
@@ -310,6 +349,8 @@ pub enum StoreErrorClass {
     UnknownRoot,
     /// A log for this root already exists.
     AlreadyExists,
+    /// The root's log is in an archived database.
+    Archived,
     /// The opening's policy file is missing from the store.
     PolicyUnavailable,
     /// The supplied policy file is not the one the opening names.
@@ -328,6 +369,7 @@ impl From<&CreateError> for StoreErrorClass {
     fn from(error: &CreateError) -> Self {
         match error {
             CreateError::AlreadyExists { .. } => StoreErrorClass::AlreadyExists,
+            CreateError::Archived { .. } => StoreErrorClass::Archived,
             CreateError::Malformed { .. } => StoreErrorClass::Malformed,
             CreateError::PolicyFileMismatch => StoreErrorClass::PolicyMismatch,
             CreateError::Storage(_) => StoreErrorClass::Storage,
@@ -358,6 +400,7 @@ impl From<&AppendError> for StoreErrorClass {
     fn from(error: &AppendError) -> Self {
         match error {
             AppendError::Conflict { .. } => StoreErrorClass::Conflict,
+            AppendError::ReadClaimLost => StoreErrorClass::Conflict,
             AppendError::Storage(_) => StoreErrorClass::Storage,
             #[cfg(feature = "postgres")]
             AppendError::Postgres(_) => StoreErrorClass::Storage,
@@ -371,8 +414,16 @@ impl From<&AppendError> for StoreErrorClass {
 pub enum OpenError {
     #[error("the database at {path} is damaged: {detail}")]
     Damaged { path: String, detail: String },
-    #[error("the database at {path} is at schema version {found}, and this build writes {expected}")]
-    ForeignSchema { path: String, found: i64, expected: i64 },
+    #[error(
+        "the database at {path} was written by a newer appa (schema version {found}; this build reads up to {supported}); upgrade appa"
+    )]
+    Newer { path: String, found: i64, supported: i64 },
+    #[error(
+        "the database at {path} is at schema version {found}, older than the oldest this build upgrades ({oldest}); move it aside to start a new one"
+    )]
+    Incompatible { path: String, found: i64, oldest: i64 },
+    #[error("cannot move the database aside at {path}: {detail}")]
+    Archive { path: String, detail: String },
     #[error("storage failure: {0}")]
     Storage(#[from] rusqlite::Error),
     #[cfg(feature = "postgres")]
@@ -384,6 +435,10 @@ pub enum OpenError {
 pub enum CreateError {
     #[error("a log for root {root} already exists")]
     AlreadyExists { root: String },
+    /// The root's log was in a database this build could not upgrade, which was archived.
+    /// Opening it again would restart it at the starting label.
+    #[error("root {root} was recorded in an archived database")]
+    Archived { root: String },
     #[error("the opening batch is not usable as one: {detail}")]
     Malformed { detail: String },
     /// The supplied file is not the one the opening record names. The opening carries the
@@ -423,6 +478,8 @@ pub enum ReadError {
 pub enum AppendError {
     #[error("the log is at {current}, not the position this decision was read at")]
     Conflict { current: u64 },
+    #[error("the embedded read no longer owns its claim")]
+    ReadClaimLost,
     #[error("storage failure: {0}")]
     Storage(#[from] rusqlite::Error),
     #[cfg(feature = "postgres")]
@@ -459,8 +516,24 @@ impl LogStore {
         }
     }
 
+    /// Open the SQLite file at `path`, upgrading an older schema in place. A database too old
+    /// to upgrade is moved aside to the returned path and replaced by a fresh one. Its roots
+    /// stay closed: [`LogStore::create_root`] refuses each with [`CreateError::Archived`].
+    pub fn open_archiving(path: &Path) -> Result<(LogStore, Option<PathBuf>), OpenError> {
+        let (sqlite, archive) = Sqlite::open_archiving(path)?;
+        Ok((
+            LogStore {
+                store: Store::Sqlite(sqlite),
+                #[cfg(feature = "fault-injection")]
+                faults: Default::default(),
+            },
+            archive,
+        ))
+    }
+
     /// Open the log. A fresh database gets the schema and its version stamp; an existing one is
-    /// checked for damage and for a version this build understands, and refused otherwise.
+    /// checked for damage, upgraded in place from a version this build knows how to upgrade,
+    /// and refused otherwise.
     pub fn open(backend: Backend) -> Result<LogStore, OpenError> {
         let store = match backend {
             Backend::Sqlite { path } => Store::Sqlite(Sqlite::open(&path)?),
@@ -654,7 +727,7 @@ impl LogStore {
             &based_on.root,
             based_on.basis,
             encode(facts, Some(observation)),
-            observation.key(),
+            observation.key().as_deref(),
         )
     }
 
@@ -751,10 +824,270 @@ impl LogStore {
             Store::Postgres(pg) => pg.has_pending_receipts(root).map_err(Into::into),
         }
     }
+
+    /// Hold a peer message for `receiver`, not yet notified, until `now + ttl`. The same
+    /// transaction drops the receiver's expired messages, then its oldest beyond `quota`.
+    #[allow(clippy::too_many_arguments, reason = "each argument is one column of the held row")]
+    pub fn hold_peer_message(
+        &self,
+        receiver: &TrajectoryId,
+        digest: PeerDigest,
+        label: &Label,
+        body: &str,
+        now: SystemTime,
+        ttl: Duration,
+        quota: usize,
+    ) -> Result<HeldNotice, HeldError> {
+        let held = held::NewHeld::new(label, now, ttl)?;
+        match &self.store {
+            Store::Sqlite(sqlite) => sqlite.hold_peer_message(receiver, digest, body, &held, now, quota),
+            #[cfg(feature = "postgres")]
+            Store::Postgres(pg) => pg.hold_peer_message(receiver, digest, body, &held, now, quota),
+        }?;
+        Ok(held.notice(digest, label))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_embedded_peer(
+        &self,
+        root: &TrajectoryId,
+        sender: &TrajectoryId,
+        recipient: &TrajectoryId,
+        pending_spawn: Option<&str>,
+        dispatch: &str,
+        digest: &PeerDigest,
+        label: &Label,
+        body: &str,
+        now: SystemTime,
+    ) -> Result<EmbeddedClaim, EmbeddedError> {
+        let fresh = embedded::NewEmbedded::fresh(
+            root.as_str(),
+            sender.as_str(),
+            recipient.as_str(),
+            pending_spawn,
+            dispatch,
+            digest,
+            label,
+            body,
+            now,
+        )?;
+        match &self.store {
+            Store::Sqlite(sqlite) => sqlite.claim_embedded_peer(&fresh),
+            #[cfg(feature = "postgres")]
+            Store::Postgres(pg) => pg.claim_embedded_peer(&fresh),
+        }
+    }
+
+    pub fn load_embedded_peer(&self, root: &TrajectoryId, id: &str) -> Result<Option<EmbeddedRow>, EmbeddedError> {
+        match &self.store {
+            Store::Sqlite(sqlite) => sqlite.load_embedded_peer(root.as_str(), id),
+            #[cfg(feature = "postgres")]
+            Store::Postgres(pg) => pg.load_embedded_peer(root.as_str(), id),
+        }
+    }
+
+    /// Null bodies of held and direct rows that can no longer be returned. Proof rows stay.
+    /// A completed read receipt is not unread inbox data and is left alone.
+    pub fn expire_embedded_inbox(&self, root: &TrajectoryId, now: SystemTime) -> Result<(), EmbeddedError> {
+        let now = embedded::millis(now);
+        match &self.store {
+            Store::Sqlite(sqlite) => sqlite.expire_embedded_inbox(root.as_str(), now),
+            #[cfg(feature = "postgres")]
+            Store::Postgres(pg) => pg.expire_embedded_inbox(root.as_str(), now),
+        }
+    }
+
+    pub fn list_embedded_peer(
+        &self,
+        root: &TrajectoryId,
+        recipient: &TrajectoryId,
+        now: SystemTime,
+    ) -> Result<Vec<EmbeddedRow>, EmbeddedError> {
+        let now = embedded::millis(now);
+        match &self.store {
+            Store::Sqlite(sqlite) => sqlite.list_embedded_peer(root.as_str(), recipient.as_str(), now),
+            #[cfg(feature = "postgres")]
+            Store::Postgres(pg) => pg.list_embedded_peer(root.as_str(), recipient.as_str(), now),
+        }
+    }
+
+    pub fn take_embedded_direct(
+        &self,
+        root: &TrajectoryId,
+        id: &str,
+        sender: &TrajectoryId,
+        recipient: &TrajectoryId,
+        digest: &PeerDigest,
+    ) -> Result<DirectTake, EmbeddedError> {
+        match &self.store {
+            Store::Sqlite(sqlite) => sqlite.take_embedded_direct(
+                root.as_str(),
+                id,
+                sender.as_str(),
+                recipient.as_str(),
+                &digest.to_string(),
+            ),
+            #[cfg(feature = "postgres")]
+            Store::Postgres(pg) => pg.take_embedded_direct(
+                root.as_str(),
+                id,
+                sender.as_str(),
+                recipient.as_str(),
+                &digest.to_string(),
+            ),
+        }
+    }
+
+    pub fn claim_embedded_read(
+        &self,
+        root: &TrajectoryId,
+        id: &str,
+        recipient: &TrajectoryId,
+        call_id: &str,
+        arguments: &str,
+    ) -> Result<ReadTake, EmbeddedError> {
+        match &self.store {
+            Store::Sqlite(sqlite) => {
+                sqlite.claim_embedded_read(root.as_str(), id, recipient.as_str(), call_id, arguments)
+            }
+            #[cfg(feature = "postgres")]
+            Store::Postgres(pg) => pg.claim_embedded_read(root.as_str(), id, recipient.as_str(), call_id, arguments),
+        }
+    }
+
+    /// Store the receipt only if `generation` still owns the read. `false` means another
+    /// caller took the ticket or the row was released; nothing was written.
+    pub fn finish_embedded_read(
+        &self,
+        root: &TrajectoryId,
+        id: &str,
+        call_id: &str,
+        generation: i64,
+        decision: &str,
+    ) -> Result<bool, EmbeddedError> {
+        match &self.store {
+            Store::Sqlite(sqlite) => sqlite.finish_embedded_read(root.as_str(), id, call_id, generation, decision),
+            #[cfg(feature = "postgres")]
+            Store::Postgres(pg) => pg.finish_embedded_read(root.as_str(), id, call_id, generation, decision),
+        }
+    }
+
+    /// Return an unopened read to the inbox only if `generation` still holds the opening
+    /// ticket. A bound or finished read is left alone. `false` means this caller no longer owns it.
+    pub fn release_embedded_read(
+        &self,
+        root: &TrajectoryId,
+        id: &str,
+        call_id: &str,
+        generation: i64,
+    ) -> Result<bool, EmbeddedError> {
+        match &self.store {
+            Store::Sqlite(sqlite) => sqlite.release_embedded_read(root.as_str(), id, call_id, generation),
+            #[cfg(feature = "postgres")]
+            Store::Postgres(pg) => pg.release_embedded_read(root.as_str(), id, call_id, generation),
+        }
+    }
+
+    /// Append engine facts only while this read owns its ticket. A batch that opens a dispatch
+    /// or admits a value binds the ticket in the same transaction, so a release cannot put the
+    /// row back in the inbox after the log has consumed the message.
+    pub fn append_holding_embedded_read(
+        &self,
+        based_on: &Log,
+        facts: &[Fact],
+        observation: Option<&HostObservation>,
+        hold: &embedded::EmbeddedAppendHold<'_>,
+    ) -> Result<(), AppendError> {
+        let bytes = encode(facts, observation);
+        let key = observation.and_then(HostObservation::key);
+        match &self.store {
+            Store::Sqlite(sqlite) => {
+                sqlite
+                    .appender()
+                    .append_holding_read(&based_on.root, based_on.basis, &bytes, key.as_deref(), hold)
+            }
+            #[cfg(feature = "postgres")]
+            Store::Postgres(pg) => pg.append_holding_read(&based_on.root, based_on.basis, bytes, key.as_deref(), hold),
+        }
+    }
+
+    /// The receiver's unexpired messages it was not yet told of, oldest first. Each is told
+    /// once: the same transaction marks them notified.
+    pub fn peer_notices(&self, receiver: &TrajectoryId, now: SystemTime) -> Result<Vec<HeldNotice>, HeldError> {
+        match &self.store {
+            Store::Sqlite(sqlite) => sqlite.peer_notices(receiver, now),
+            #[cfg(feature = "postgres")]
+            Store::Postgres(pg) => pg.peer_notices(receiver, now),
+        }
+    }
+
+    /// One unexpired held message of the receiver, without its body and without taking it.
+    pub fn peek_peer_message(
+        &self,
+        receiver: &TrajectoryId,
+        id: &HeldPeerId,
+        now: SystemTime,
+    ) -> Result<Option<HeldNotice>, HeldError> {
+        match &self.store {
+            Store::Sqlite(sqlite) => sqlite.peek_peer_message(receiver, id, now),
+            #[cfg(feature = "postgres")]
+            Store::Postgres(pg) => pg.peek_peer_message(receiver, id, now),
+        }
+    }
+
+    /// Take one held message of the receiver with its body, deleting it. An expired message is
+    /// deleted and reads as `None`.
+    pub fn take_peer_message(
+        &self,
+        receiver: &TrajectoryId,
+        id: &HeldPeerId,
+        now: SystemTime,
+    ) -> Result<Option<HeldPeerMessage>, HeldError> {
+        match &self.store {
+            Store::Sqlite(sqlite) => sqlite.take_peer_message(receiver, id, now),
+            #[cfg(feature = "postgres")]
+            Store::Postgres(pg) => pg.take_peer_message(receiver, id, now),
+        }
+    }
 }
 
 #[cfg(feature = "fault-injection")]
 impl LogStore {
+    /// Drop a stored read receipt without touching the engine log. Tests use this to
+    /// simulate a crash after admission and before the receipt was written.
+    pub fn testing_clear_embedded_decision(&self, root: &TrajectoryId, id: &str) -> Result<(), EmbeddedError> {
+        match &self.store {
+            Store::Sqlite(sqlite) => sqlite.testing_clear_embedded_decision(root.as_str(), id),
+            #[cfg(feature = "postgres")]
+            Store::Postgres(pg) => pg.testing_clear_embedded_decision(root.as_str(), id),
+        }
+    }
+
+    /// Force a row past its TTL without waiting. The next list, send, or receive nulls a
+    /// held or direct body. A completed read receipt is left.
+    pub fn testing_expire_embedded(&self, root: &TrajectoryId, id: &str) -> Result<(), EmbeddedError> {
+        match &self.store {
+            Store::Sqlite(sqlite) => sqlite.testing_expire_embedded(root.as_str(), id),
+            #[cfg(feature = "postgres")]
+            Store::Postgres(pg) => pg.testing_expire_embedded(root.as_str(), id),
+        }
+    }
+
+    /// Replace the stored body. Tests use this to show recovery refuses an admission that
+    /// no longer matches the row.
+    pub fn testing_replace_embedded_body(
+        &self,
+        root: &TrajectoryId,
+        id: &str,
+        body: &str,
+    ) -> Result<(), EmbeddedError> {
+        match &self.store {
+            Store::Sqlite(sqlite) => sqlite.testing_replace_embedded_body(root.as_str(), id, body),
+            #[cfg(feature = "postgres")]
+            Store::Postgres(pg) => pg.testing_replace_embedded_body(root.as_str(), id, body),
+        }
+    }
+
     /// A foreign writer wins the race in its own committed transaction, exactly as a second
     /// process would. It takes the position and records nothing, so this caller's append
     /// conflicts on position and replays, and an assertion reads whose write landed from the
@@ -941,6 +1274,127 @@ mod tests {
             trajectory: root(),
             kind: appa_engine::fact::BoundaryKind::VoidReturn,
         }]
+    }
+
+    /// A database file holding `root()`, rewritten to look as a build at `version` left it:
+    /// stamped `version`, without the tables later versions added.
+    fn written_at(version: i64) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("a temp dir is creatable");
+        let path = dir.path().join("appa.db");
+        LogStore::open(Backend::Sqlite { path: path.clone() })
+            .expect("a fresh store opens")
+            .create_root(opening(&root()), POLICY.as_bytes())
+            .expect("the root opens");
+        let old = rusqlite::Connection::open(&path).expect("the file reopens");
+        old.execute_batch("DROP TABLE held_peer_messages; DROP TABLE archived_roots;")
+            .expect("the later tables drop");
+        old.pragma_update(None, "user_version", version)
+            .expect("the version moves back");
+        (dir, path)
+    }
+
+    #[test]
+    fn the_oldest_upgradable_database_upgrades_in_place_and_keeps_its_logs() {
+        let (_dir, path) = written_at(5);
+        let (store, archive) = LogStore::open_archiving(&path).expect("the database upgrades");
+        assert_eq!(archive, None);
+        assert_eq!(
+            store.log(&root()).expect("the old log reads").policy_file(),
+            POLICY.as_bytes()
+        );
+        drop(store);
+        LogStore::open(Backend::Sqlite { path }).expect("the upgraded database is current");
+    }
+
+    #[test]
+    fn a_database_too_old_to_upgrade_is_archived_and_its_roots_stay_closed() {
+        let (dir, path) = written_at(4);
+        assert!(matches!(
+            LogStore::open(Backend::Sqlite { path: path.clone() }).err(),
+            Some(OpenError::Incompatible { found: 4, .. })
+        ));
+
+        let (store, archive) = LogStore::open_archiving(&path).expect("the database is replaced");
+        let archive = archive.expect("the old database is moved aside");
+        assert!(matches!(
+            store.create_root(opening(&root()), POLICY.as_bytes()),
+            Err(CreateError::Archived { .. })
+        ));
+        let fresh = TrajectoryId::new("cc:fresh");
+        store
+            .create_root(opening(&fresh), POLICY.as_bytes())
+            .expect("a new session opens");
+        let kept: i64 = rusqlite::Connection::open(&archive)
+            .expect("the archive opens")
+            .query_row(
+                "SELECT COUNT(*) FROM logs WHERE root = ?1",
+                params![root().as_str()],
+                |row| row.get(0),
+            )
+            .expect("the archived log reads");
+        assert_eq!(kept, 1, "the archive keeps the old log");
+        drop(store);
+
+        let (store, again) = LogStore::open_archiving(&path).expect("the replacement reopens");
+        assert_eq!(again, None);
+        assert!(matches!(
+            store.create_root(opening(&root()), POLICY.as_bytes()),
+            Err(CreateError::Archived { .. })
+        ));
+        assert!(store.has_root(&fresh).expect("the check runs"));
+        let archives = std::fs::read_dir(dir.path())
+            .expect("the directory lists")
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .is_ok_and(|entry| entry.file_name().to_string_lossy().contains(".archived-"))
+            })
+            .count();
+        assert_eq!(archives, 1);
+    }
+
+    #[test]
+    fn concurrent_archivers_leave_one_archive_and_keep_its_roots_closed() {
+        let (dir, path) = written_at(4);
+        let opened: Vec<_> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..4)
+                .map(|_| scope.spawn(|| LogStore::open_archiving(&path).expect("the database opens")))
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("the worker finishes"))
+                .collect()
+        });
+        assert_eq!(opened.iter().filter(|(_, archive)| archive.is_some()).count(), 1);
+        for (store, _) in &opened {
+            assert!(matches!(
+                store.create_root(opening(&root()), POLICY.as_bytes()),
+                Err(CreateError::Archived { .. })
+            ));
+        }
+        let archives = std::fs::read_dir(dir.path())
+            .expect("the directory lists")
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .is_ok_and(|entry| entry.file_name().to_string_lossy().contains(".archived-"))
+            })
+            .count();
+        assert_eq!(archives, 1);
+    }
+
+    #[test]
+    fn a_database_another_connection_holds_is_not_archived() {
+        let (_dir, path) = written_at(4);
+        let holder = rusqlite::Connection::open(&path).expect("another connection opens");
+        let _: i64 = holder
+            .query_row("SELECT COUNT(*) FROM logs", [], |row| row.get(0))
+            .expect("the other connection reads, then idles");
+
+        assert!(matches!(
+            LogStore::open_archiving(&path).err(),
+            Some(OpenError::Incompatible { found: 4, .. })
+        ));
     }
 
     fn memory() -> LogStore {
@@ -1149,6 +1603,7 @@ mod tests {
         let wire = |class: StoreErrorClass| match class {
             StoreErrorClass::UnknownRoot => "unknown_root",
             StoreErrorClass::AlreadyExists => "already_exists",
+            StoreErrorClass::Archived => "archived",
             StoreErrorClass::PolicyUnavailable => "policy_unavailable",
             StoreErrorClass::PolicyMismatch => "policy_mismatch",
             StoreErrorClass::Undecodable => "undecodable",
@@ -1159,6 +1614,7 @@ mod tests {
         for class in [
             StoreErrorClass::UnknownRoot,
             StoreErrorClass::AlreadyExists,
+            StoreErrorClass::Archived,
             StoreErrorClass::PolicyUnavailable,
             StoreErrorClass::PolicyMismatch,
             StoreErrorClass::Undecodable,
@@ -1306,6 +1762,103 @@ mod tests {
             store.roots_mentioning("offer:on").unwrap(),
             Vec::new(),
             "a key matches whole, so one key is never a prefix of another"
+        );
+    }
+
+    fn peer_observations(root: &TrajectoryId) -> [HostObservation; 4] {
+        let digest = PeerDigest::of_body("hello");
+        [
+            HostObservation::Addressed {
+                address: PeerAddress::parse("uds:/tmp/appa/peer.sock").expect("the address parses"),
+            },
+            HostObservation::Titled {
+                title: SessionTitle::parse("peer-a").expect("the title parses"),
+            },
+            HostObservation::PeerSent {
+                digest,
+                label: Label::new(
+                    appa_engine::label::Trust::new(1),
+                    appa_engine::label::Audience::public(),
+                ),
+                dispatch: DispatchId::new(
+                    root.clone(),
+                    serde_json::from_value(serde_json::json!("00".repeat(32))).expect("a call digest parses"),
+                    0,
+                ),
+            },
+            HostObservation::PeerAdmitted { digest },
+        ]
+    }
+
+    #[test]
+    fn peer_observations_name_their_keys_and_the_roots_that_recorded_them() {
+        let store = opened();
+        let [addressed, titled, sent, admitted] = peer_observations(&root());
+        let address = PeerAddress::parse("uds:/tmp/appa/peer.sock").expect("the address parses");
+        let title = SessionTitle::parse("peer-a").expect("the title parses");
+        let digest = PeerDigest::of_body("hello");
+        let keys = [
+            peer_address_key(&address),
+            peer_title_key(&title),
+            peer_sent_key(&digest),
+        ];
+        assert_eq!(
+            [&addressed, &titled, &sent].map(HostObservation::key),
+            keys.clone().map(Some)
+        );
+        assert_eq!(admitted.key(), None);
+        assert_eq!(
+            keys,
+            [
+                "peer-address:uds:/tmp/appa/peer.sock".to_owned(),
+                "peer-title:peer-a".to_owned(),
+                format!("peer-sent:{digest}"),
+            ]
+        );
+
+        for observation in [&addressed, &titled, &sent, &admitted] {
+            store
+                .append_host(&store.log(&root()).unwrap(), &[], observation)
+                .unwrap();
+        }
+        for key in &keys {
+            assert_eq!(store.roots_mentioning(key).unwrap(), vec![root()], "{key}");
+        }
+        assert_eq!(
+            store
+                .roots_mentioning(&peer_sent_key(&PeerDigest::of_body("other")))
+                .unwrap(),
+            Vec::new()
+        );
+        assert_eq!(
+            observations(&store.log(&root()).unwrap()),
+            vec![addressed, titled, sent, admitted],
+            "the records read back as written"
+        );
+    }
+
+    #[test]
+    fn peer_observations_round_trip_under_their_wire_spelling() {
+        let digest = PeerDigest::of_body("hello");
+        for observation in peer_observations(&root()) {
+            let wire = serde_json::to_value(&observation).expect("an observation serializes");
+            assert_eq!(
+                serde_json::from_value::<HostObservation>(wire).expect("an observation deserializes"),
+                observation
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(HostObservation::PeerAdmitted { digest }).unwrap(),
+            serde_json::json!({"kind": "peer_admitted", "digest": digest.to_string()})
+        );
+        assert!(
+            serde_json::from_value::<HostObservation>(serde_json::json!({
+                "kind": "peer_admitted",
+                "digest": digest.to_string(),
+                "body": "hello",
+            }))
+            .is_err(),
+            "an admitted record never carries the body"
         );
     }
 
@@ -1924,6 +2477,60 @@ mod tests {
             Ok(())
         })
         .expect("the isolated test receipts clean up");
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "requires OPENAPPA_TEST_DATABASE_URL and host migrations"]
+    fn postgres_a_held_message_is_notified_once_and_taken_once() {
+        let store = postgres_store(1);
+        let unique = tempfile::tempdir().expect("a unique receiver name exists");
+        let suffix = unique.path().display().to_string();
+        held::tests::a_held_message_is_notified_once_and_taken_once(&store, &suffix);
+        let receiver = format!("held-receiver:{suffix}");
+        let remaining: i64 = store
+            .lease()
+            .expect("a connection leases")
+            .postgres()
+            .expect("the PostgreSQL API is present")
+            .with_client(move |client| {
+                Ok(client
+                    .query_one(
+                        "SELECT COUNT(*) FROM openappa_held_peer_messages WHERE receiver=$1",
+                        &[&receiver],
+                    )?
+                    .get(0))
+            })
+            .expect("the held rows count");
+        assert_eq!(remaining, 0, "every held row was taken");
+    }
+
+    /// The peer keys are written beside the record on this backend too.
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "requires OPENAPPA_TEST_DATABASE_URL and host migrations"]
+    fn postgres_peer_keys_find_the_root_that_recorded_them() {
+        let store = postgres_store(1);
+        let root = postgres_root(&store, "peer");
+        let observations = peer_observations(&root);
+        for observation in &observations {
+            store.append_host(&store.log(&root).unwrap(), &[], observation).unwrap();
+        }
+        for key in observations.iter().filter_map(HostObservation::key) {
+            assert!(store.roots_mentioning(&key).unwrap().contains(&root), "{key}");
+        }
+        let cleaned = root.as_str().to_owned();
+        store
+            .lease()
+            .unwrap()
+            .postgres()
+            .unwrap()
+            .with_client(move |client| {
+                client.execute("DELETE FROM openappa_host_keys WHERE root=$1", &[&cleaned])?;
+                Ok(())
+            })
+            .unwrap();
+        forget_postgres_roots(&store, vec![root]);
     }
 
     #[cfg(all(feature = "postgres", feature = "fault-injection"))]

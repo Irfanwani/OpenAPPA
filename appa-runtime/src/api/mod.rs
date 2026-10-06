@@ -1,8 +1,10 @@
 //! The runtime API: `Runtime` and `Session` — the harness-agnostic
 //! event model this crate declares.
 
+mod embedded;
 pub(crate) mod files;
 mod host;
+pub(crate) mod peer;
 mod session;
 
 /// The fixture-only `Value` → raw-bytes helper, shared with the other
@@ -23,6 +25,7 @@ pub use appa_runtime_api::{
     Actor, OfferedRemedy, OutcomeBody, PromptKey, ProposedCall, Review, SpawnBinding, SpawnKind, SpawnRef, ToolOutcome,
     TrajectoryId,
 };
+pub use embedded::{EmbeddedPeerArrival, EmbeddedPeerError, EmbeddedPeerId, EmbeddedPeerNotice};
 pub(crate) use session::{LateOpen, Session, is_control_tool};
 
 /// Why a host could not read a root's current status.
@@ -176,7 +179,7 @@ pub(crate) fn call_key(call: &ProposedCall) -> Option<PermitKey> {
     if bare == "yell" {
         return crate::yell::YellArgs::parse(&call.arguments).map(|args| args.ticket());
     }
-    if !MANAGEMENT_TOOLS.contains(&bare) && !files::owns(call) {
+    if !MANAGEMENT_TOOLS.contains(&bare) && !files::owns(call) && bare != peer::READ_PEER_MESSAGE {
         return None;
     }
     let mut arguments = serde_json::from_str::<serde_json::Value>(call.arguments.get()).ok()?;
@@ -455,12 +458,17 @@ pub enum OpenError {
     },
     #[error("annotator {0} names the builtin \"jev\", but the deployment declares no [externals.jev]")]
     JevNotConfigured(String),
+    #[error("annotator {0} names the builtin \"archestra\", but the host supplies no archestra endpoint")]
+    #[cfg(feature = "archestra")]
+    ArchestraNotConfigured(String),
     #[error("annotator {0} names the builtin \"jev\", which judges the complete call and takes no inputs")]
     JevInputs(String),
     #[error("annotator {0} names the builtin \"jev\", whose mandate must admit at least two trust ranks")]
     JevTrustRanks(String),
     #[error("the database is damaged: {0}")]
     Damaged(String),
+    #[error("{0}")]
+    Schema(String),
     #[error("storage failure: {0}")]
     Storage(String),
 }
@@ -506,6 +514,10 @@ pub(crate) enum EventError {
     UnknownTrajectory,
     #[error("a trajectory with this id already exists")]
     TrajectoryExists,
+    #[error(
+        "this session started under an APPA version whose database could not be upgraded, so its label is unknown; start a new session"
+    )]
+    RootArchived,
     #[error("the session principal {0:?} is not an address")]
     MalformedPrincipal(String),
     #[error("the session already acts for another principal")]
@@ -554,6 +566,8 @@ pub(crate) enum EventError {
         "delegation to {tool} is not declared by the policy: an agent runs as a child only under a contract that names it, and the wildcard covers no spawn"
     )]
     UndeclaredSpawn { tool: String },
+    #[error("a peer message of {bytes} bytes exceeds the {limit} bytes a session takes in")]
+    PeerMessageTooLarge { bytes: usize, limit: usize },
     #[error("storage failure: {0}")]
     Storage(String),
 }
@@ -602,6 +616,7 @@ impl EventError {
             | EventError::RemedyArguments { .. }
             | EventError::UnknownTrajectory
             | EventError::TrajectoryExists
+            | EventError::RootArchived
             | EventError::UnknownDispatch
             | EventError::OutcomeMismatch
             | EventError::UnknownOffer
@@ -609,6 +624,7 @@ impl EventError {
             | EventError::SpawnNotTaken
             | EventError::SpawnAmbiguous
             | EventError::UndeclaredSpawn { .. }
+            | EventError::PeerMessageTooLarge { .. }
             | EventError::BindingMismatch => false,
         }
     }
@@ -951,11 +967,23 @@ impl Prepared {
         } else {
             None
         };
-        let store = LogStore::open(backend).map_err(|error| match error {
+        let opened = match backend {
+            Backend::Sqlite { path } => LogStore::open_archiving(&path),
+            backend => LogStore::open(backend).map(|store| (store, None)),
+        };
+        let (store, archive) = opened.map_err(|error| match error {
             appa_eventlog::OpenError::Damaged { path, detail } => OpenError::Damaged(format!("{path}: {detail}")),
-            error @ appa_eventlog::OpenError::ForeignSchema { .. } => OpenError::Damaged(error.to_string()),
+            error @ (appa_eventlog::OpenError::Newer { .. } | appa_eventlog::OpenError::Incompatible { .. }) => {
+                OpenError::Schema(error.to_string())
+            }
             error => OpenError::Storage(error.to_string()),
         })?;
+        if let Some(archive) = archive {
+            tracing::warn!(
+                archive = %archive.display(),
+                "the database was too old to upgrade; it was moved aside and its sessions cannot resume"
+            );
+        }
         Ok(self.with_store(Arc::new(store), state_path))
     }
 
@@ -2027,6 +2055,7 @@ impl Runtime {
             })
             .map_err(|error| match error {
                 appa_eventlog::CreateError::AlreadyExists { .. } => EventError::TrajectoryExists,
+                appa_eventlog::CreateError::Archived { .. } => EventError::RootArchived,
                 error => EventError::Storage(error.to_string()),
             })?;
         Ok(Session::attach(
@@ -3179,6 +3208,10 @@ fn validate_deployment(policy: &appa_policy::Config, externals: &crate::config::
             appa_policy::AnnotatorBuiltin::Jev if externals.jev.is_none() => {
                 return Err(OpenError::JevNotConfigured(name.to_string()));
             }
+            #[cfg(feature = "archestra")]
+            appa_policy::AnnotatorBuiltin::Archestra if externals.archestra.is_none() => {
+                return Err(OpenError::ArchestraNotConfigured(name.to_string()));
+            }
             // Jev judges the complete call and answers the lowest or the highest rank.
             appa_policy::AnnotatorBuiltin::Jev if !binding.inputs.is_empty() => {
                 return Err(OpenError::JevInputs(name.to_string()));
@@ -3195,6 +3228,8 @@ fn validate_deployment(policy: &appa_policy::Config, externals: &crate::config::
             appa_policy::AnnotatorBuiltin::Jev
             | appa_policy::AnnotatorBuiltin::Llm
             | appa_policy::AnnotatorBuiltin::ClaudeCode => {}
+            #[cfg(feature = "archestra")]
+            appa_policy::AnnotatorBuiltin::Archestra => {}
         }
     }
     bound_exactly("annotator", bound_by_deployment.into_iter(), &externals.annotators)?;
@@ -3494,14 +3529,9 @@ mod deployment_tests {
 
     /// A hosted document whose host sets each of `keys`.
     fn hosted_with_keys(document: &str, keys: &[&str]) -> Config {
-        Config::hosted(
-            document,
-            HostDefaults {
-                consult_timeout: Duration::from_secs(30),
-                max_body_bytes: 65_536,
-            },
-            |var| keys.contains(&var).then(|| "sekret".to_string()),
-        )
+        Config::hosted(document, HostDefaults::new(Duration::from_secs(30), 65_536), |var| {
+            keys.contains(&var).then(|| "sekret".to_string())
+        })
         .expect("the hosted document validates")
     }
 
@@ -3845,14 +3875,9 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
 
     /// A hosted document parsed without its keys.
     fn deferred(document: &str) -> Config {
-        Config::hosted_included_deferred(
-            document,
-            HostDefaults {
-                consult_timeout: Duration::from_secs(30),
-                max_body_bytes: 65_536,
-            },
-            |_| Err(crate::config::IncludeResolution::Unknown),
-        )
+        Config::hosted_included_deferred(document, HostDefaults::new(Duration::from_secs(30), 65_536), |_| {
+            Err(crate::config::IncludeResolution::Unknown)
+        })
         .expect("the deferred document validates")
     }
 
@@ -4072,7 +4097,9 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
                 &view,
                 appa_runtime_api::HookEvent::SessionStart {
                     root: root.clone(),
-                    principal: None
+                    principal: None,
+                    address: None,
+                    title: None,
                 }
             )
             .await,
@@ -4093,6 +4120,8 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
             appa_runtime_api::HookEvent::SessionStart {
                 root: later.clone(),
                 principal: None,
+                address: None,
+                title: None,
             },
         )
         .await;
@@ -4153,7 +4182,9 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
                 &runtime.on(Arc::clone(&lease)),
                 appa_runtime_api::HookEvent::SessionStart {
                     root: root.clone(),
-                    principal: None
+                    principal: None,
+                    address: None,
+                    title: None,
                 }
             )
             .await,
@@ -4196,7 +4227,9 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
                 &runtime,
                 appa_runtime_api::HookEvent::SessionStart {
                     root: root.clone(),
-                    principal: None
+                    principal: None,
+                    address: None,
+                    title: None,
                 }
             )
             .await,
@@ -4286,7 +4319,9 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
                     &recorded,
                     appa_runtime_api::HookEvent::SessionStart {
                         root: root.clone(),
-                        principal: None
+                        principal: None,
+                        address: None,
+                        title: None,
                     }
                 )
                 .await,
@@ -4905,7 +4940,9 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
                 &runtime,
                 appa_runtime_api::HookEvent::SessionStart {
                     root: root.clone(),
-                    principal: None
+                    principal: None,
+                    address: None,
+                    title: None,
                 }
             )
             .await,
@@ -4958,7 +4995,9 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
                 &runtime,
                 appa_runtime_api::HookEvent::SessionStart {
                     root: root.clone(),
-                    principal: None
+                    principal: None,
+                    address: None,
+                    title: None,
                 }
             )
             .await,
@@ -5004,6 +5043,8 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
                 appa_runtime_api::HookEvent::SessionStart {
                     root: root.clone(),
                     principal: None,
+                    address: None,
+                    title: None,
                 },
             )
             .await;
@@ -5047,6 +5088,8 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
                 appa_runtime_api::HookEvent::SessionStart {
                     root: root.clone(),
                     principal: None,
+                    address: None,
+                    title: None,
                 },
             )
             .await;
@@ -5090,6 +5133,8 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
             appa_runtime_api::HookEvent::SessionStart {
                 root: root.clone(),
                 principal: None,
+                address: None,
+                title: None,
             },
         )
         .await;
@@ -5138,6 +5183,8 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
                 appa_runtime_api::HookEvent::SessionStart {
                     root: root.clone(),
                     principal: None,
+                    address: None,
+                    title: None,
                 },
             )
             .await;
@@ -5203,6 +5250,8 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
             appa_runtime_api::HookEvent::SessionStart {
                 root: root.clone(),
                 principal: None,
+                address: None,
+                title: None,
             },
         )
         .await;
@@ -5254,6 +5303,8 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
             appa_runtime_api::HookEvent::SessionStart {
                 root: root.clone(),
                 principal: None,
+                address: None,
+                title: None,
             },
         )
         .await;
@@ -5289,6 +5340,8 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
                 appa_runtime_api::HookEvent::SessionStart {
                     root: root.clone(),
                     principal: None,
+                    address: None,
+                    title: None,
                 },
             )
             .await;
@@ -5308,6 +5361,8 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
                 actor,
                 text: "go on".to_string(),
                 settles: None,
+                peer: None,
+                title: None,
             },
         )
         .await;
@@ -5362,6 +5417,8 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
                 appa_runtime_api::HookEvent::SessionStart {
                     root: root.clone(),
                     principal: None,
+                    address: None,
+                    title: None,
                 },
             )
             .await;
@@ -5438,6 +5495,8 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
             appa_runtime_api::HookEvent::SessionStart {
                 root: root.clone(),
                 principal: None,
+                address: None,
+                title: None,
             },
         )
         .await;
@@ -5492,7 +5551,9 @@ delta = { audience = { resolver = "directory", argument = "customer" } }
                 &runtime,
                 appa_runtime_api::HookEvent::SessionStart {
                     root: root.clone(),
-                    principal: None
+                    principal: None,
+                    address: None,
+                    title: None,
                 }
             )
             .await,
@@ -5613,7 +5674,9 @@ url = "{url}"
                 &runtime,
                 HookEvent::SessionStart {
                     root: root(),
-                    principal: None
+                    principal: None,
+                    address: None,
+                    title: None,
                 }
             )
             .await,

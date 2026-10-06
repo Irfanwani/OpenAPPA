@@ -18,6 +18,18 @@ concurrency:
   cancel-in-progress: ${{ github.event.action != 'labeled' }}
 
 jobs:
+  archestra-update-tests:
+    name: Archestra Update Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout updater
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test release validation and PR lifecycle
+        run: python3 .github/scripts/test_appa_archestra_update.py
+
   cargo-release-age:
     name: Cargo Release Age
     runs-on: ubuntu-latest
@@ -187,6 +199,7 @@ jobs:
               - 'scripts/lint_batteries.py'
               - 'scripts/test_lint_batteries.py'
               - 'scripts/lint_battery_toml.py'
+              - 'scripts/test_battery_readiness.py'
               - 'Cargo.lock'
               - '.github/workflows/ci.yml'
             integration: &integration
@@ -398,6 +411,13 @@ jobs:
             python3 -m unittest discover -s "$dir" -p 'test_*.py'
           done < <(find marketplace -type f -name 'test_*.py' -exec dirname {} + | sort -u)
 
+      # A battery ships a readiness check that reaches its provider with the
+      # deployment's credential, so what it reports and what it keeps out of
+      # the result is asserted here. These checks live beside the batteries
+      # rather than in them, so discovery above never reaches them.
+      - name: Battery readiness checks
+        run: python3 -m unittest scripts/test_battery_readiness.py
+
   installer-checks:
     name: Installer Checks (${{ matrix.os }})
     needs: changes
@@ -452,7 +472,7 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Rust lint
-        run: cargo clippy --workspace --all-targets --features appa-eventlog/postgres,appa/postgres --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --features appa-eventlog/postgres,appa/postgres,appa/archestra --locked -- -D warnings
 
       - name: Rust lint (runtime without the daemon feature)
         run: cargo clippy -p appa --lib --tests --no-default-features --locked -- -D warnings
@@ -500,7 +520,12 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Rust tests
-        run: cargo test --workspace --features appa-eventlog/postgres,appa/postgres --locked
+        run: cargo test --workspace --features appa-eventlog/postgres,appa/postgres,appa/archestra --locked
+
+      # The workspace run above unifies the archestra feature into appa-policy; this run
+      # checks a build without it refuses the builtin.
+      - name: Rust tests (policy without the archestra builtin)
+        run: cargo test -p appa-policy --locked
 
       - name: Install the host schema
         run: psql "$OPENAPPA_TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f appa-eventlog/tests/fixtures/host_schema.sql
