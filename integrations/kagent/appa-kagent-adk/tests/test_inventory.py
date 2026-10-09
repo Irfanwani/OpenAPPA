@@ -265,6 +265,8 @@ LOG_ANALYST = "agent:kagent/log-analyst"
             "list_pods..kagent__NS__log_analyst",
             id="a-glued-second-spelling",
         ),
+        # A spelling of the right shape this inventory never gave out.
+        pytest.param("mcp:other/list_pods", "mcp:other/list_pods", id="never-issued"),
     ],
 )
 def test_despell_replaces_a_whole_spelling_and_leaves_every_longer_identifier(text, expected):
@@ -324,6 +326,7 @@ def _oracle(names, text):
         pytest.param(f"Retry {LIST_PODS}. Then {LOG_ANALYST}!", id="punctuation"),
         pytest.param(f"{LOG_ANALYST}:{LIST_PODS}", id="colon-joined"),
         pytest.param(f"[{LIST_PODS}]({LOG_ANALYST})", id="bracketed-pair"),
+        pytest.param("mcp:other/list_pods", id="never-issued"),
     ],
 )
 def test_despell_matches_the_whole_spelling_oracle(text):
