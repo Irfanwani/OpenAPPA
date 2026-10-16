@@ -17,7 +17,7 @@
 include = ["batteries/github/appa.toml"]
 
 # This deployment serves the canned GitHub tools through demo-tools.
-[server_aliases]
+[aliases.mcp]
 github = ["server-08e41db0f96ead55c0f5060212bbab69ea691ef7ca97123f038d72b7294acee7"]
 
 [policy]
@@ -366,3 +366,8 @@ command = ["/usr/bin/curl", "--silent", "--show-error", "--max-time", "29", "--h
 
 [externals.sanitizers.strip-instructions]
 command = ["/usr/bin/curl", "--silent", "--show-error", "--max-time", "29", "--header", "Content-Type: application/json", "--data-binary", "@-", "http://appa-demo-mocks.kagent.svc.cluster.local:8081/sanitize"]
+
+# The shared runtime composes the github battery's multi-user target, whose
+# member lookups this roster answers. Empty, it maps nobody.
+[externals.audience.host-members]
+readers = {}

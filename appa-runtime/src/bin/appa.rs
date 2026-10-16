@@ -37,6 +37,11 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Configure an installed OpenCode integration in a private operator session.
+    Opencode {
+        #[command(subcommand)]
+        command: OpencodeCommand,
+    },
     /// Inspect host plugin packages for a deployment.
     Plugin {
         #[command(subcommand)]
@@ -55,6 +60,16 @@ enum Command {
     },
     /// Export a locked deployment and its artifacts for offline installation.
     Bundle(appa_runtime::installation::cli::Bundle),
+    /// Internal: rewrite a candidate root in place with an empty readers roster for
+    /// each lookup target its composition is missing, then exit once it loads.
+    #[command(hide = true)]
+    AddLookupRosters {
+        #[arg(long)]
+        config: PathBuf,
+
+        #[arg(long = "batteries-dir", action = clap::ArgAction::Append)]
+        batteries_dir: Vec<PathBuf>,
+    },
     /// Describe the configuration facts available to a human or configuring agent.
     Describe {
         #[arg(long, env = "APPA_CONFIG")]
@@ -208,6 +223,12 @@ enum PluginCommand {
 }
 
 #[derive(Subcommand)]
+enum OpencodeCommand {
+    /// Inspect and tune the policy with the project's live OpenCode tool inventory.
+    Setup(appa_runtime::installation::opencode::Setup),
+}
+
+#[derive(Subcommand)]
 enum FilesCommand {
     /// Repair a pending file operation from its recorded request and disk state.
     #[command(
@@ -347,6 +368,9 @@ fn main() -> ExitCode {
         } => appa_runtime::ui::status(args),
         Command::BuildInfo => appa_runtime::installation::native::build_info(),
         Command::ActivateClaude { config } => claude_exit(appa_runtime::init::activate_claude_code(&config)),
+        Command::Opencode {
+            command: OpencodeCommand::Setup(args),
+        } => appa_runtime::installation::opencode::setup(args),
         Command::Plugin {
             command: PluginCommand::List(args),
         } => appa_runtime::installation::cli::list(appa_package::PackageKind::Plugin, args),
@@ -425,6 +449,15 @@ fn main() -> ExitCode {
         } => {
             let config = config.unwrap_or_else(appa_runtime::init::installed_config_path);
             appa_runtime::replay::main(&config, modules_dir, verbose, &paths)
+        }
+        Command::AddLookupRosters { config, batteries_dir } => {
+            match appa_runtime::config::edit::add_missing_rosters(&config, &batteries_dir) {
+                Ok(_) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("appa add-lookup-rosters: {error}");
+                    ExitCode::FAILURE
+                }
+            }
         }
         Command::Describe {
             config,

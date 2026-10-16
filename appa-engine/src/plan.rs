@@ -9,15 +9,9 @@
 //! An empty list is a proof, not a shrug.
 //!
 //! **A redispatch clears its gap directly or is not offered**. A plan for a failed
-//! `prior(k)` names a registered tool whose `emits` includes `k`. A plan for a failed cap names a
-//! tool whose own established restrictive audience contribution, folded into the current label,
-//! lands within the cap. Only a declared audience delta can prove that: an Annotated tool's
-//! contribution exists only per call, so it claims nothing at load. The blocked target's own
-//! delta takes no part in the claim — audience only
-//! narrows under `combine`, so a candidate that clears on its own contribution still clears when
-//! the target's delta folds after it, while one that needs the target's help is target-assisted
-//! advice this module does not offer. The named tool is dispatched as an ordinary separately-checked
-//! call: its own requirements, denials, and reservations bite at its own block, when it is
+//! `prior(k)` names a registered tool whose every declared variant `emits` `k`; an Annotated
+//! variant's effects exist only per call, so it claims nothing at load. The named tool is
+//! dispatched as an ordinary separately-checked call: its own requirements, denials, and reservations bite at its own block, when it is
 //! actually proposed — a directly clearing tool is sound advice even when its own call would
 //! block today.
 //!
@@ -33,7 +27,7 @@
 //! `includes` via `reader_ceiling`, `no_prior` via `waivers`, attention via `attends`), `Accept`
 //! (narrowing), `Withhold` (execution without admitting result output), `Sanitize` (an
 //! output sanitizer's relabel standing in for the raw crossing),
-//! `Derive` (an input sanitizer's substitution of the whole argument set), and `Redispatch` over direct `prior(k)` emitters and static cap-narrowing tools, in
+//! `Derive` (an input sanitizer's substitution of the whole argument set), and `Redispatch` over direct `prior(k)` emitters, in
 //! name order — the agent picks, and each redispatch is separately checked for real.
 //! The empty-proof is complete over exactly this subset.
 //!
@@ -45,16 +39,17 @@
 //! narrowing, so the sanitizer adds alternatives, never remedies for a requirement gap.
 //!
 //! **A marked spawn declares its child's return policy here.** The spawn is blocked until an
-//! approval carries one, and every plan for it ends in a `Return` step: the floor the parent
-//! supplies at execution, and the sanitizer — none, the schema attestation, or one registered
-//! untagged output sanitizer — the plan names. A child return itself is never planned: it
+//! approval carries one, and every plan for it ends in a `Return` step: no return at all, or the
+//! floor the parent supplies at execution and the sanitizer — none, the schema attestation, or
+//! one registered untagged output sanitizer — the plan names. A child return itself is never planned: it
 //! crosses at the child's stop, or is refused there, against the policy the fork recorded.
 //!
 //! **A fork's floor binds the child's remedies.** Inside a forked trajectory no plan accepts a
 //! narrowing below the floor its parent set, on the dimensions the fork's sanitizer does not
 //! raise: [`narrowing_remedies`] and [`confined_stage`] omit the acceptance, and the remaining
 //! plans stand. A grandchild's floor is declared against the child's own, so the bound is
-//! inherited down the family.
+//! inherited down the family. A void return sets no floor: nothing its child holds crosses
+//! back, so the child stands unbound, as a root does.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -64,9 +59,11 @@ use serde::{Deserialize, Serialize};
 use crate::authority::{Authority, DeclaredTransition, Mandate, Sanitizer};
 use crate::candidate::{CallStage, SanitizerLineage};
 use crate::check::{self, CallRole, Gap, Narrowing, RawBlock};
-use crate::contract::ToolAnnotation;
-use crate::fact::EffectKind;
-use crate::label::{Audience, Evaluation, Label, MembershipContext, MembershipNeeded, SymbolicAtom, WithinAssertions};
+use crate::contract::{StaticAnnotation, ToolAnnotation, ToolDeclaration};
+use crate::fact::{CrossingReturn, EffectKind, EffectSet, ReturnPolicy, ReturnRoute, ReturnSanitizer};
+use crate::label::{
+    Audience, Evaluation, Expansions, Label, MembershipContext, MembershipNeeded, SymbolicAtom, WithinAssertions,
+};
 use crate::names::{AuthorityName, SanitizerName, TagName};
 use crate::projection::Views;
 use crate::registry::Registry;
@@ -89,9 +86,9 @@ impl PlanId {
 /// that admits the dispatch despite a gap; `Accept` records the agent's acceptance of the
 /// narrowing; `Withhold` binds no-result delivery to the dispatch; `Sanitize` binds an output
 /// sanitizer to the dispatch; `Return` declares the
-/// child's return policy on a marked spawn — the floor is the parent's parameter at execution,
-/// the sanitizer (none, `attest-schema` over a schema the parent also supplies, or a registered
-/// output sanitizer) is the plan's. None edits a trajectory label — `Sanitize` changes only
+/// child's return policy on a marked spawn — no return at all, or a floor that is the parent's
+/// parameter at execution behind the plan's sanitizer (none, `attest-schema` over a schema the
+/// parent also supplies, or a registered output sanitizer). None edits a trajectory label — `Sanitize` changes only
 /// which value is admitted when the result comes back, and the fold does the rest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RemedyStep {
@@ -100,7 +97,7 @@ pub enum RemedyStep {
     Withhold,
     Sanitize(SanitizerName),
     Derive(SanitizerName),
-    Return(Option<SanitizerName>),
+    Return(ReturnRoute),
 }
 
 /// The result treatment a selected call remedy binds to its eventual dispatch. `None` on an
@@ -176,12 +173,11 @@ impl ExecutableRemedyPlan {
         })
     }
 
-    /// The return sanitizer this plan declares for a marked spawn's child, where the plan
-    /// declares a return policy at all: `Some(None)` for a bare floor, `Some(Some(name))` for
-    /// a floor behind the named sanitizer, `None` for a plan on an ordinary call.
-    pub fn return_step(&self) -> Option<Option<&SanitizerName>> {
+    /// The return route this plan declares for a marked spawn's child, or `None` for a plan on
+    /// an ordinary call.
+    pub fn return_step(&self) -> Option<&ReturnRoute> {
         self.steps.iter().find_map(|step| match step {
-            RemedyStep::Return(sanitizer) => Some(sanitizer.as_ref()),
+            RemedyStep::Return(route) => Some(route),
             RemedyStep::Authorize(_)
             | RemedyStep::Accept(_)
             | RemedyStep::Withhold
@@ -212,10 +208,10 @@ pub struct RedispatchPlan {
 }
 
 impl RedispatchPlan {
-    /// `None` unless at least one gap is claimed and every claimed gap is a redispatch species —
-    /// `prior(k)` or a cap, the two redispatch shapes.
+    /// `None` unless at least one gap is claimed and every claimed gap is a `prior(k)`, the one
+    /// redispatch shape.
     pub fn new(tool: ToolName, clears: Vec<Gap>) -> Option<RedispatchPlan> {
-        let valid = !clears.is_empty() && clears.iter().all(|gap| matches!(gap, Gap::Prior(_) | Gap::Cap { .. }));
+        let valid = !clears.is_empty() && clears.iter().all(|gap| matches!(gap, Gap::Prior(_)));
         valid.then_some(RedispatchPlan { tool, clears })
     }
 
@@ -263,6 +259,22 @@ pub struct PlannedBlock {
     /// Advice, never a remedy: a child begins at the same label, so a fork cures no requirement.
     /// Kept out of `plans` so the emptiness assertion stays about remedies.
     pub fork_advice: Option<ForkAdvice>,
+    /// Advice, never a remedy: what accepting the block's narrowing does to the rest of the
+    /// policy's argument-free tools. `None` when nothing narrows or nothing gets worse.
+    pub narrowing_impact: Option<NarrowingImpact>,
+}
+
+/// How a narrowing moves the policy's argument-free tools, judged on the current history:
+/// of `tools` analysed, `sign_off` start needing an authority and `blocked` lose every
+/// authority and input sanitizer that could clear them. `recipient_checked` names the tools
+/// with a declared variant that checks recipients from its arguments against an audience this
+/// narrowing reduces; they are not judged, since the verdict depends on the recipients.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NarrowingImpact {
+    pub tools: usize,
+    pub sign_off: usize,
+    pub blocked: usize,
+    pub recipient_checked: Vec<ToolName>,
 }
 
 /// Advice, never a remedy, on delegating a blocked call to a child. The planner decides which
@@ -275,21 +287,25 @@ pub enum ForkAdvice {
     /// trajectory may declare takes the narrowed value and hands back one this trajectory
     /// receives unchanged: it admits the narrowed label, and its derivation holds at the
     /// current label on every dimension.
+    /// `preserving_output` when an output sanitizer this block offers derives a label this
+    /// trajectory receives unchanged, so its plan clears the narrowing without accepting it.
     Narrowing {
         standing: FloorStanding,
         sanitized_return: bool,
+        preserving_output: bool,
     },
 }
 
 /// Where a narrowing stands against the floor a fork set on this trajectory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FloorStanding {
-    /// A root: no fork bounds it, and a child can take the change in its place.
+    /// No floor bounds it — a root, or a child whose parent takes no return — and a child can
+    /// take the change in its place.
     Unbound,
     /// The floor permits the change: the parent declared it to be accepted here, and a child
     /// under the same floor gains nothing.
     Within,
-    /// The floor refuses the change here and in every child under it.
+    /// The floor refuses the change here and in every child whose return crosses under it.
     Below,
 }
 
@@ -357,10 +373,11 @@ pub(crate) fn plan(
 
     let terminal = |plan: &RemedyPlan| plan.executable().is_some_and(|plan| plan.hop().is_none());
     if !plans.iter().any(terminal) && !raw.requirement_gaps.is_empty() {
-        let mut needs = NeededAtoms::default();
-        let redispatches = direct_redispatches(registry, &current, raw, context, &mut needs);
-        needs.refuse_if_any()?;
-        plans.extend(redispatches.into_iter().map(RemedyPlan::Redispatch));
+        plans.extend(
+            direct_redispatches(registry, raw)
+                .into_iter()
+                .map(RemedyPlan::Redispatch),
+        );
     }
     let fork_advice = match (role, &raw.narrowing) {
         (CallRole::MarkedSpawn(_), _) => None,
@@ -372,13 +389,149 @@ pub(crate) fn plan(
                 Some(_) => FloorStanding::Below,
             },
             sanitized_return: preserving_return_exists(registry, &current, narrowing, floor.as_ref(), context),
+            preserving_output: preserving_output_offered(registry, contract, &current, &plans, context),
         }),
     };
+    let narrowing_impact = raw.narrowing.as_ref().and_then(|narrowing| {
+        narrowing_impact(
+            registry,
+            narrowing,
+            &contract.emits,
+            floor.as_ref(),
+            &has_committed,
+            &has_reserved,
+            context,
+        )
+    });
     Ok(PlannedBlock {
         raw: raw.clone(),
         plans,
         fork_advice,
+        narrowing_impact,
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Standing {
+    Clear,
+    SignOff,
+    Blocked,
+}
+
+/// Each argument-free variant judged by the planner's one-stage remedies before and after the narrowing;
+/// a tool counts by its worst variant. Reads a fresh `Expansions`, so an undecided membership
+/// drops the variant instead of asking, and the operation's evidence stays untouched.
+fn narrowing_impact(
+    registry: &Registry,
+    narrowing: &Narrowing,
+    emits: &EffectSet,
+    floor: Option<&Floor>,
+    has_committed: &impl Fn(&EffectKind) -> bool,
+    has_reserved: &impl Fn(&EffectKind) -> bool,
+    context: &MembershipContext<'_>,
+) -> Option<NarrowingImpact> {
+    let unanswered = Expansions::default();
+    let context = MembershipContext::new(context.within, context.providers, &unanswered);
+    let accepted = |kind: &EffectKind| emits.contains(kind) || has_committed(kind);
+    let standing = |tool: &StaticAnnotation<'_>, label: &Label, has_committed: &dyn Fn(&EffectKind) -> bool| {
+        let annotation = tool.annotation();
+        let block = check::evaluate_static(tool, label, &has_committed, has_reserved, &context).ok()?;
+        let gaps = &block.requirement_gaps;
+        let mut needs = NeededAtoms::default();
+        let settles = !narrowing_remedies(
+            registry,
+            label,
+            annotation,
+            block.narrowing.as_ref(),
+            floor,
+            &context,
+            &mut needs,
+        )
+        .is_empty();
+        let covered = |needs: &mut NeededAtoms| {
+            // Every gap and authority is read, so an undecided cover drops the variant whatever the order.
+            gaps.iter().fold(true, |all, gap| {
+                let held = registry.authorities().iter().fold(false, |held, authority| {
+                    match gap_cover(authority, gap, &annotation.tags, &context) {
+                        Evaluation::Holds => true,
+                        Evaluation::Fails => held,
+                        Evaluation::Needs(needed) => {
+                            needs.absorb(needed);
+                            held
+                        }
+                    }
+                });
+                all && held
+            })
+        };
+        // An input hop, or another tool's call for a `prior` gap, is a route outside this
+        // one-stage view.
+        let redispatch = gaps.iter().any(|gap| matches!(gap, Gap::Prior(_)));
+        let hops = |needs: &mut NeededAtoms| {
+            !input_hops(
+                registry,
+                annotation,
+                check::CallReads::Static,
+                &CallStage::default(),
+                CallRole::Ordinary,
+                gaps,
+                label,
+                &context,
+                needs,
+            )
+            .is_empty()
+        };
+        let standing = if settles && gaps.is_empty() {
+            Some(Standing::Clear)
+        } else if redispatch || hops(&mut needs) {
+            None
+        } else if settles && covered(&mut needs) {
+            Some(Standing::SignOff)
+        } else {
+            Some(Standing::Blocked)
+        };
+        needs.refuse_if_any().ok()?;
+        standing
+    };
+    let mut impact = NarrowingImpact {
+        tools: 0,
+        sign_off: 0,
+        blocked: 0,
+        recipient_checked: Vec::new(),
+    };
+    let audience_narrows = narrowing.to.audience != narrowing.from.audience;
+    for name in registry.tool_names() {
+        if audience_narrows
+            && registry
+                .variants(name)
+                .filter_map(ToolDeclaration::declared)
+                .any(ToolAnnotation::reads_recipients)
+        {
+            impact.recipient_checked.push(name.clone());
+        }
+        let Some((before, after)) = registry
+            .variants(name)
+            .filter_map(ToolDeclaration::declared)
+            .filter_map(|tool| StaticAnnotation::of(tool).ok())
+            .filter_map(|tool| {
+                Some((
+                    standing(&tool, &narrowing.from, has_committed)?,
+                    standing(&tool, &narrowing.to, &accepted)?,
+                ))
+            })
+            .reduce(|(before, after), (next_before, next_after)| (before.max(next_before), after.max(next_after)))
+        else {
+            continue;
+        };
+        impact.tools += 1;
+        match after {
+            _ if after <= before => {}
+            Standing::Blocked => impact.blocked += 1,
+            Standing::SignOff => impact.sign_off += 1,
+            Standing::Clear => {}
+        }
+    }
+    (impact.sign_off + impact.blocked > 0 || !impact.recipient_checked.is_empty()).then_some(impact)
 }
 
 /// The executable plans of one stage over an explicit state: the branch's label and the
@@ -415,6 +568,7 @@ pub(crate) fn enumerate_plans(
     let mut candidates: Vec<PlanCandidate> = input_hops(
         registry,
         contract,
+        check::CallReads::Resolved(call),
         stage,
         role,
         &block.requirement_gaps,
@@ -441,7 +595,7 @@ pub(crate) fn enumerate_plans(
             &mut needs,
         );
         // An ordinary call declares no return policy; a marked spawn declares exactly one.
-        let returns: Vec<Option<Option<SanitizerName>>> = match role {
+        let returns: Vec<Option<ReturnRoute>> = match role {
             CallRole::Ordinary => vec![None],
             CallRole::MarkedSpawn(kind) => return_options(registry, floor, kind).into_iter().map(Some).collect(),
         };
@@ -457,8 +611,8 @@ pub(crate) fn enumerate_plans(
                     if let NarrowingSettlement::Sanitize(sanitizer) = settlement {
                         steps.push(RemedyStep::Sanitize(sanitizer.clone()));
                     }
-                    if let Some(sanitizer) = declares {
-                        steps.push(RemedyStep::Return(sanitizer.clone()));
+                    if let Some(route) = declares {
+                        steps.push(RemedyStep::Return(route.clone()));
                     }
                     candidates.push(PlanCandidate {
                         steps,
@@ -469,17 +623,21 @@ pub(crate) fn enumerate_plans(
         }
     }
     needs.refuse_if_any()?;
-    Ok(
-        least_mandate_first(registry, &block.requirement_gaps, candidates, context)
-            .into_iter()
-            .enumerate()
-            .map(|(position, candidate)| ExecutableRemedyPlan {
-                id: PlanId(position as u32),
-                steps: candidate.steps,
-                required: candidate.required,
-            })
-            .collect(),
+    Ok(least_mandate_first(
+        registry,
+        &block.requirement_gaps,
+        candidates,
+        &check::forwarded_label(contract, check::CallReads::Resolved(call)).audience,
+        context,
     )
+    .into_iter()
+    .enumerate()
+    .map(|(position, candidate)| ExecutableRemedyPlan {
+        id: PlanId(position as u32),
+        steps: candidate.steps,
+        required: candidate.required,
+    })
+    .collect())
 }
 
 /// The membership atoms enumeration read without a pinned answer, aggregated across every
@@ -523,9 +681,10 @@ fn least_mandate_first(
     registry: &Registry,
     gaps: &[Gap],
     candidates: Vec<PlanCandidate>,
+    forwarded: &Audience,
     context: &MembershipContext<'_>,
 ) -> Vec<PlanCandidate> {
-    let reads = RankingReads::resolve(registry, gaps, &candidates);
+    let reads = RankingReads::resolve(registry, gaps, &candidates, forwarded);
     // Each candidate's power on each gap, computed once: the selection compares them many times.
     let powers: Vec<Vec<GapPower<'_>>> = candidates
         .iter()
@@ -583,7 +742,14 @@ struct RankingReads<'a> {
 }
 
 impl<'a> RankingReads<'a> {
-    fn resolve(registry: &'a Registry, gaps: &[Gap], candidates: &'a [PlanCandidate]) -> RankingReads<'a> {
+    /// A substitution's power is its target met with what the call forwards: the hop replaces
+    /// the arguments only, as the route ranking reads it.
+    fn resolve(
+        registry: &'a Registry,
+        gaps: &[Gap],
+        candidates: &'a [PlanCandidate],
+        forwarded: &Audience,
+    ) -> RankingReads<'a> {
         let mut reads = RankingReads {
             ceilings: BTreeMap::new(),
             targets: BTreeMap::new(),
@@ -614,7 +780,7 @@ impl<'a> RankingReads<'a> {
                     reads
                         .targets
                         .entry(sanitizer)
-                        .or_insert_with(|| Audience::of_declared(to));
+                        .or_insert_with(|| Audience::of_declared(to).combine(forwarded));
                 }
             }
         }
@@ -711,7 +877,7 @@ pub(crate) fn gap_power_cmp(
         Gap::Attention(_) => Some(Ordering::Equal),
         // These gaps have no covering authority by construction (`enumerate_assignments` returns
         // `None`), so no assignment reaching this comparison carries one.
-        Gap::Prior(_) | Gap::Cap { .. } => Some(Ordering::Equal),
+        Gap::Prior(_) => Some(Ordering::Equal),
     }
 }
 
@@ -836,11 +1002,14 @@ pub(crate) fn narrowing_remedies(
     settlements
 }
 
-/// Every input-substitution progress hop this call stage offers, in registry name order.
+/// Every input-substitution progress hop this call stage offers, in registry name order. A
+/// substitution replaces the arguments only, so a hop is offered where its derived label, met
+/// with what the call forwards, clears a recipient — exactly as the check reads it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn input_hops(
     registry: &Registry,
     contract: &ToolAnnotation,
+    reads: check::CallReads<'_>,
     stage: &CallStage,
     role: CallRole,
     gaps: &[Gap],
@@ -855,6 +1024,7 @@ pub(crate) fn input_hops(
         return Vec::new();
     }
     let released = stage.released(current);
+    let forwarded = check::forwarded_label(contract, reads);
     registry
         .sanitizers()
         .filter(|sanitizer| !stage.lineage().contains(&sanitizer.name))
@@ -862,7 +1032,7 @@ pub(crate) fn input_hops(
             // An undecided admission or clearing joins the aggregate refusal instead of
             // shrinking the menu.
             match sanitizer.derive_input(&released, &contract.tags, context) {
-                Ok(Some(derived)) => clears_a_recipient(&derived, gaps, context, needs),
+                Ok(Some(derived)) => clears_a_recipient(&derived.combine(&forwarded), gaps, context, needs),
                 Ok(None) => false,
                 Err(needed) => {
                     needs.absorb(needed);
@@ -1038,21 +1208,23 @@ impl Floor {
     }
 }
 
-/// The floor that binds this trajectory, or `None` for a root, which no fork bounds.
+/// The floor that binds this trajectory, or `None` for a root or a child whose parent takes no
+/// return, which no floor bounds.
 pub(crate) fn floor_of(registry: &Registry, views: &Views) -> Option<Floor> {
     let trajectory = views.trajectory();
-    let policy = views.return_policy_of(trajectory)?;
+    let policy = views.return_policy_of(trajectory)?.crossing()?;
     let parent = views.parent_of(trajectory)?;
     let raised = policy
-        .sanitizer_name()
-        .and_then(|name| registry.sanitizer(&name))
+        .sanitizer
+        .as_ref()
+        .and_then(|sanitizer| registry.sanitizer(&sanitizer.name()))
         .map(|sanitizer| sanitizer.transition.applied());
     Some(Floor::new(policy.floor.combine(&views.branch_label(parent)), raised))
 }
 
-/// The return sanitizers a marked spawn may declare here, in registry name order behind the
-/// bare floor: the reserved attestation when it is registered, and every untagged output
-/// sanitizer. Under a floor, a sanitizer whose mandate lands below it is not offered — the
+/// The return routes a marked spawn may declare here: the bare floor, then in registry name order
+/// the reserved attestation when it is registered and every untagged output sanitizer, then no
+/// return. Under a floor, a sanitizer whose mandate lands below it is not offered — the
 /// grandchild's return could never cross the child. A fan-out spawn is not offered the
 /// attestation: it holds only for a child started while the parent is trusted, which the
 /// declaration checks once and a fan-out's later children need not meet.
@@ -1060,8 +1232,8 @@ pub(crate) fn return_options(
     registry: &Registry,
     floor: Option<&Floor>,
     kind: crate::transition::SpawnKind,
-) -> Vec<Option<SanitizerName>> {
-    let mut options = vec![None];
+) -> Vec<ReturnRoute> {
+    let mut options = vec![ReturnRoute::Raw];
     options.extend(
         registry
             .sanitizers()
@@ -1072,9 +1244,37 @@ pub(crate) fn return_options(
                     Floor::new(floor.label().clone(), None).holds(&sanitizer.transition.applied().derive(floor.label()))
                 })
             })
-            .map(|sanitizer| Some(sanitizer.name.clone())),
+            .map(|sanitizer| ReturnRoute::Sanitized(sanitizer.name.clone())),
     );
+    options.push(ReturnRoute::Void);
     options
+}
+
+/// Does an offered output-sanitizer plan derive, from the label its sanitizer binds over, one
+/// `current` receives unchanged? Advice costs the block no directory read: an undecided
+/// derivation counts as no such plan.
+fn preserving_output_offered(
+    registry: &Registry,
+    contract: &ToolAnnotation,
+    current: &Label,
+    plans: &[RemedyPlan],
+    context: &MembershipContext<'_>,
+) -> bool {
+    let unanswered = Expansions::default();
+    let context = MembershipContext::new(context.within, context.providers, &unanswered);
+    let output = contract.output_label();
+    plans
+        .iter()
+        .filter_map(RemedyPlan::executable)
+        .filter_map(|plan| match plan.output_remedy() {
+            Some(OutputRemedy::Sanitize(name)) => registry.sanitizer(&name),
+            Some(OutputRemedy::Withhold) | None => None,
+        })
+        .any(|sanitizer| {
+            sanitizer
+                .derive_output(&output, &contract.tags, &context)
+                .is_ok_and(|derived| derived.is_some_and(|derived| current.combine(&derived) == *current))
+        })
 }
 
 /// Does a return sanitizer this trajectory may declare take the narrowed value and hand back
@@ -1094,8 +1294,10 @@ fn preserving_return_exists(
     let unchanged = Floor::new(current.clone(), None);
     return_options(registry, floor, crate::transition::SpawnKind::Single)
         .into_iter()
-        .flatten()
-        .filter_map(|name| registry.sanitizer(&name))
+        .filter_map(|route| match route {
+            ReturnRoute::Sanitized(name) => registry.sanitizer(&name),
+            ReturnRoute::Raw | ReturnRoute::Void => None,
+        })
         .filter(|sanitizer| {
             !sanitizer.name.is_attest_schema()
                 || attest_ceiling(&sanitizer.transition).is_some_and(|ceiling| current.meets_floor(ceiling))
@@ -1110,8 +1312,8 @@ fn preserving_return_exists(
 /// Why a parent's declared return policy is not one its spawn's plan can carry.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ReturnPolicyRefusal {
-    #[error("the declared return sanitizer is not the one the selected plan names")]
-    SanitizerMismatch,
+    #[error("the declared return route is not the one the selected plan names")]
+    RouteMismatch,
     #[error(
         "the floor stands above this trajectory's label: a child starts at that label and cannot rise to the floor"
     )]
@@ -1124,7 +1326,8 @@ pub enum ReturnPolicyRefusal {
     SanitizerUnavailable,
 }
 
-/// Is `policy` the declaration `step` asks for, at this trajectory's label? The floor sits at or
+/// Is `policy` the declaration `step` asks for, at this trajectory's label? A void return
+/// declares nothing to check: no value crosses it. The floor sits at or
 /// below the label — a child starts there and only descends — and at or above the floor this
 /// trajectory itself stands under, so a grandchild inherits the bound; an attestation needs the
 /// reserved sanitizer registered at a rank this label covers; a named sanitizer is a registered
@@ -1132,12 +1335,19 @@ pub enum ReturnPolicyRefusal {
 pub(crate) fn declared_return_policy(
     registry: &Registry,
     views: &Views,
-    step: Option<&SanitizerName>,
-    policy: &crate::fact::ReturnPolicy,
+    step: &ReturnRoute,
+    policy: &ReturnPolicy,
 ) -> Result<(), ReturnPolicyRefusal> {
-    if policy.sanitizer_name().as_ref() != step {
-        return Err(ReturnPolicyRefusal::SanitizerMismatch);
+    if policy.route() != *step {
+        return Err(ReturnPolicyRefusal::RouteMismatch);
     }
+    match policy {
+        ReturnPolicy::Void => Ok(()),
+        ReturnPolicy::Crossing(crossing) => declared_crossing(registry, views, crossing),
+    }
+}
+
+fn declared_crossing(registry: &Registry, views: &Views, policy: &CrossingReturn) -> Result<(), ReturnPolicyRefusal> {
     let current = views.current_label();
     if current.combine(&policy.floor) != policy.floor {
         return Err(ReturnPolicyRefusal::FloorAboveLabel);
@@ -1147,7 +1357,7 @@ pub(crate) fn declared_return_policy(
     }
     match &policy.sanitizer {
         None => Ok(()),
-        Some(crate::fact::ReturnSanitizer::Attest(_)) => {
+        Some(ReturnSanitizer::Attest(_)) => {
             let registered = registry
                 .sanitizer(&SanitizerName::new(SanitizerName::ATTEST_SCHEMA))
                 .ok_or(ReturnPolicyRefusal::AttestUnavailable)?;
@@ -1159,10 +1369,8 @@ pub(crate) fn declared_return_policy(
         }
         // The reserved route attests a shape: naming it without one would take the
         // generic sanitizer path, which validates nothing.
-        Some(crate::fact::ReturnSanitizer::Named(name)) if name.is_attest_schema() => {
-            Err(ReturnPolicyRefusal::SanitizerMismatch)
-        }
-        Some(crate::fact::ReturnSanitizer::Named(name)) => match registry.sanitizer(name) {
+        Some(ReturnSanitizer::Named(name)) if name.is_attest_schema() => Err(ReturnPolicyRefusal::RouteMismatch),
+        Some(ReturnSanitizer::Named(name)) => match registry.sanitizer(name) {
             Some(registered) if registered.on.output && registered.applies_to(&[]) => Ok(()),
             _ => Err(ReturnPolicyRefusal::SanitizerUnavailable),
         },
@@ -1234,7 +1442,7 @@ pub(crate) fn gap_cover(
         Gap::NoPrior(kind) => Evaluation::of_exact(authority.scope.covers(tags) && mandate.waivers.contains(kind)),
         // Attention routes by its own currency — the attended mark — never by scope.
         Gap::Attention(mark) => Evaluation::of_exact(mandate.attends.covers(mark)),
-        Gap::Prior(_) | Gap::Cap { .. } => Evaluation::Fails,
+        Gap::Prior(_) => Evaluation::Fails,
     }
 }
 
@@ -1248,8 +1456,8 @@ pub(crate) fn covers_gap(authority: &Authority, gap: &Gap, tags: &[TagName], con
 /// The atoms the planning of one surfaced block reads, so the operation answers them
 /// before [`plan`] runs — the deterministic second gathering stage, a pure function of the
 /// block and the policy. Each read site of the enumeration is mirrored by its
-/// gate here: an `includes` gap reads the mandate of every in-scope authority (`gap_cover`);
-/// a `cap` gap reads every tool's delta. A sanitizer's transition is not gathered: its
+/// gate here: an `includes` gap reads the mandate of every in-scope authority (`gap_cover`).
+/// A sanitizer's transition is not gathered: its
 /// admission derives from the value's label first and asks for members only where the
 /// enumeration itself finds derivation short, so the gate would demand atoms the decision
 /// never reads. The check's own reads — the call's contract — are the check stage's.
@@ -1261,15 +1469,6 @@ pub(crate) fn block_atoms(registry: &Registry, contract: &ToolAnnotation, raw: &
         for authority in registry.authorities() {
             if authority.scope.covers(&contract.tags) {
                 atoms.extend(authority.mandate.needed_atoms(providers));
-            }
-        }
-    }
-    if has(|gap| matches!(gap, Gap::Cap { .. })) {
-        for tool in registry.tools().filter_map(crate::contract::ToolDeclaration::declared) {
-            // A placeholder delta names its collection only per call; a cap comparison against
-            // it waits for that call.
-            if let Some(crate::contract::DeltaAudience::Static(audience)) = &tool.delta.audience {
-                atoms.extend(audience.needed_atoms(providers));
             }
         }
     }
@@ -1291,13 +1490,7 @@ pub(crate) fn plan_atoms(registry: &Registry, plan: &ExecutableRemedyPlan) -> Ve
     atoms
 }
 
-fn direct_redispatches(
-    registry: &Registry,
-    current: &Label,
-    raw: &RawBlock,
-    context: &MembershipContext<'_>,
-    needs: &mut NeededAtoms,
-) -> Vec<RedispatchPlan> {
+fn direct_redispatches(registry: &Registry, raw: &RawBlock) -> Vec<RedispatchPlan> {
     let mut direct = Vec::new();
     // A redispatch names the tool, not one ordered contract, so it clears a gap only when every
     // variant of that tool clears it.
@@ -1305,7 +1498,7 @@ fn direct_redispatches(
         let variant_clears: Vec<Vec<Gap>> = registry
             .variants(name)
             .map(|declaration| match declaration.declared() {
-                Some(tool) => direct_clears(tool, &raw.requirement_gaps, current, context, needs),
+                Some(tool) => direct_clears(tool, &raw.requirement_gaps),
                 // An Annotated variant's requirements exist only per call: it provably clears
                 // nothing at load, so the tool never qualifies as a redispatch.
                 None => Vec::new(),
@@ -1325,33 +1518,12 @@ fn direct_redispatches(
     direct
 }
 
-/// The gaps a successful call to `tool` clears by itself (RMD-13): a `prior` it emits, or a cap
-/// the label it commits from `current` stays within.
-pub(crate) fn direct_clears(
-    tool: &ToolAnnotation,
-    gaps: &[Gap],
-    current: &Label,
-    context: &MembershipContext<'_>,
-    needs: &mut NeededAtoms,
-) -> Vec<Gap> {
-    let has_cap = gaps.iter().any(|gap| matches!(gap, Gap::Cap { .. }));
-    // No call is at hand here, so a placeholder delta commits no label and clears no cap.
-    let committed =
-        (has_cap && tool.delta.selector_placeholder().is_none()).then(|| check::committed_label(tool, current));
+/// The gaps a successful call to `tool` clears by itself (RMD-13): each `prior` it emits.
+pub(crate) fn direct_clears(tool: &ToolAnnotation, gaps: &[Gap]) -> Vec<Gap> {
     gaps.iter()
-        .filter(|gap| match (gap, &committed) {
-            (Gap::Prior(kind), _) => tool.emits.contains(kind),
-            // An undecided cap comparison is a missing answer, not a refuted clearing: it joins
-            // the aggregate refusal so the redispatch list never silently shrinks.
-            (Gap::Cap { cap }, Some(committed)) => match committed.within_cap(cap, context) {
-                Evaluation::Holds => true,
-                Evaluation::Fails => false,
-                Evaluation::Needs(needed) => {
-                    needs.absorb(needed);
-                    false
-                }
-            },
-            _ => false,
+        .filter(|gap| match gap {
+            Gap::Prior(kind) => tool.emits.contains(kind),
+            Gap::TrustFloor { .. } | Gap::Includes { .. } | Gap::NoPrior(_) | Gap::Attention(_) => false,
         })
         .cloned()
         .collect()
@@ -1457,6 +1629,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::new([EffectKind::new("backup")]).unwrap(),
             requires: Requires::default(),
         };
@@ -1467,6 +1640,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 label: LabelRequirements {
@@ -1519,6 +1693,91 @@ mod tests {
         );
     }
 
+    /// A substitution replaces the arguments only. Where the call forwards content the
+    /// recipient may not read, derived arguments the recipient may read clear nothing: the
+    /// check keeps the gap, and the planner offers no hop the check would refuse.
+    #[test]
+    fn an_input_hop_never_clears_what_the_call_forwards() {
+        let internal = Audience::restricted([ReaderId::new("insider")]);
+        let widened = Audience::restricted([ReaderId::new("insider"), ReaderId::new("partner")]);
+        let partner = DeclaredAudience::restricted([ReaderId::new("partner")]);
+        let share = |forwards: Delta| ToolAnnotation {
+            description: Some("A test tool.".to_string()),
+            name: ToolName::new("share"),
+            tags: vec![],
+            delta: Delta::NONE,
+            forwards,
+            parameters: crate::params::ToolParameters::open(),
+            emits: EffectSet::default(),
+            requires: Requires {
+                label: LabelRequirements {
+                    trust_floor: None,
+                    audience: vec![AudienceRequirement::Includes(RecipientSpec::Static(partner.clone()))],
+                },
+                ..Requires::default()
+            },
+        };
+        let registry_with = |tool: ToolAnnotation| {
+            build(RegistryConfig {
+                trust_chain: chain(),
+                tools: declared(vec![tool]),
+                authorities: vec![],
+                sanitizers: vec![Sanitizer {
+                    name: SanitizerName::new("redact"),
+                    on: SanitizerPoints {
+                        input: true,
+                        output: false,
+                    },
+                    transition: DeclaredTransition::Audience {
+                        from_includes: DeclaredAudience::literal(internal.clone()),
+                        to: DeclaredAudience::literal(widened.clone()),
+                    },
+                    scope: Scope::default(),
+                    hint: None,
+                }],
+                audience: crate::audience::AudienceConfig::default(),
+                annotators: vec![],
+            })
+        };
+        let insider_only = Delta {
+            trust: None,
+            audience: Some(DeltaAudience::Static(DeclaredAudience::literal(internal.clone()))),
+        };
+        let log = vec![opened(Label::new(TRUSTED, internal.clone()))];
+        let offers_redact = |registry: &Registry| {
+            plan_of(registry, &log, &call("share", json!({})))
+                .plans
+                .iter()
+                .any(|plan| {
+                    plan.executable().and_then(ExecutableRemedyPlan::hop) == Some(&SanitizerName::new("redact"))
+                })
+        };
+        assert!(
+            offers_redact(&registry_with(share(Delta::NONE))),
+            "a call that forwards nothing is cleared by its derived arguments"
+        );
+        assert!(!offers_redact(&registry_with(share(insider_only.clone()))));
+
+        let parts = crate::label::TestContext::default();
+        let substituted = check::evaluate_state(
+            &share(insider_only),
+            &Label::new(TRUSTED, internal),
+            &|_| false,
+            &|_| false,
+            check::CallReads::Resolved(&call("share", json!({}))),
+            &CallStage::substituting(
+                Label::new(TRUSTED, widened),
+                crate::candidate::SanitizerLineage::default(),
+            ),
+            &parts.context(),
+        )
+        .expect("the check reads no symbolic audience");
+        assert_eq!(
+            substituted.requirement_gaps,
+            vec![Gap::Includes { recipients: partner }]
+        );
+    }
+
     #[test]
     fn an_annotated_tool_keeps_its_input_substitution_hops() {
         let partner = Audience::restricted([ReaderId::new("partner")]);
@@ -1529,6 +1788,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::test_string_argument_schema("to"),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 label: LabelRequirements {
@@ -1580,6 +1840,7 @@ mod tests {
             unpinned.digest(),
             ProducedAnnotation {
                 delta: annotation.delta,
+                forwards: annotation.forwards,
                 emits: annotation.emits,
                 requires: annotation.requires,
             },
@@ -1613,6 +1874,7 @@ mod tests {
             tags: vec![],
             delta,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires::default(),
         }
@@ -1753,6 +2015,7 @@ mod tests {
             unpinned.digest(),
             ProducedAnnotation {
                 delta: pinned.delta,
+                forwards: pinned.forwards,
                 emits: pinned.emits,
                 requires: pinned.requires,
             },
@@ -1845,6 +2108,7 @@ mod tests {
                 audience: None,
             },
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::new([EffectKind::new("backup.done")]).unwrap(),
             requires: Requires::default(),
         };
@@ -1854,6 +2118,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 label: LabelRequirements {
@@ -1905,121 +2170,6 @@ mod tests {
     }
 
     #[test]
-    fn a_cap_redispatch_claims_only_what_it_actually_clears() {
-        let a = || Audience::restricted([ReaderId::new("a")]);
-        let ab = || Audience::restricted([ReaderId::new("a"), ReaderId::new("b")]);
-        let narrowing_tool = |name: &str, to: Audience| ToolAnnotation {
-            description: Some("A test tool.".to_string()),
-            name: ToolName::new(name),
-            tags: vec![],
-            delta: Delta {
-                trust: None,
-                audience: Some(DeltaAudience::Static(DeclaredAudience::literal(to))),
-            },
-            parameters: crate::params::ToolParameters::open(),
-            emits: EffectSet::default(),
-            requires: Requires::default(),
-        };
-        let send = ToolAnnotation {
-            description: Some("A test tool.".to_string()),
-            name: ToolName::new("send"),
-            tags: vec![],
-            delta: Delta::NONE,
-            parameters: crate::params::ToolParameters::open(),
-            emits: EffectSet::default(),
-            requires: Requires {
-                label: LabelRequirements {
-                    trust_floor: None,
-                    audience: vec![AudienceRequirement::Cap(DeclaredAudience::literal(a()))],
-                },
-                ..Requires::default()
-            },
-        };
-        let registry = build(RegistryConfig {
-            trust_chain: chain(),
-            tools: declared(vec![
-                send,
-                narrowing_tool("narrow_all", a()),
-                narrowing_tool("narrow_some", ab()),
-            ]),
-            authorities: vec![],
-            sanitizers: vec![],
-            audience: crate::audience::AudienceConfig::default(),
-            annotators: vec![],
-        });
-        let log = vec![opened(known(TRUSTED, Audience::public()))];
-        let planned = plan_of(&registry, &log, &call("send", json!({})));
-
-        assert_eq!(
-            planned.plans,
-            vec![redispatch(
-                "narrow_all",
-                vec![Gap::Cap {
-                    cap: DeclaredAudience::literal(a())
-                }]
-            )]
-        );
-    }
-
-    #[test]
-    fn only_an_established_static_contribution_claims_a_cap_clear() {
-        let a = Audience::restricted([ReaderId::new("a")]);
-        let send = ToolAnnotation {
-            description: Some("A test tool.".to_string()),
-            name: ToolName::new("send"),
-            tags: vec![],
-            delta: Delta::NONE,
-            parameters: crate::params::ToolParameters::open(),
-            emits: EffectSet::default(),
-            requires: Requires {
-                label: LabelRequirements {
-                    trust_floor: None,
-                    audience: vec![AudienceRequirement::Cap(DeclaredAudience::literal(a))],
-                },
-                ..Requires::default()
-            },
-        };
-        let contract = |name: &str, delta: Delta| ToolAnnotation {
-            description: Some("A test tool.".to_string()),
-            name: ToolName::new(name),
-            tags: vec![],
-            delta,
-            parameters: crate::params::ToolParameters::open(),
-            emits: EffectSet::default(),
-            requires: Requires::default(),
-        };
-        let registry = build(RegistryConfig {
-            trust_chain: chain(),
-            tools: vec![
-                ToolDeclaration::Declared(send),
-                // An Annotated tool's contribution exists only per call: it claims no cap clear.
-                ToolDeclaration::Annotated {
-                    name: ToolName::new("annotated"),
-                    tags: vec![],
-                    description: Some("A test tool.".to_string()),
-                    parameters: crate::params::test_string_argument_schema("to"),
-                    annotator: crate::names::AnnotatorName::new("acl"),
-                },
-                ToolDeclaration::Declared(contract("neutral", Delta::NONE)),
-            ],
-            authorities: vec![],
-            sanitizers: vec![],
-            audience: crate::audience::AudienceConfig::default(),
-            annotators: vec![crate::registry::AnnotatorDeclaration {
-                name: crate::names::AnnotatorName::new("acl"),
-                trust: None,
-                audiences: None,
-                marks: None,
-                effects: None,
-            }],
-        });
-        let log = vec![opened(known(TRUSTED, Audience::public()))];
-        let planned = plan_of(&registry, &log, &call("send", json!({})));
-        assert!(planned.plans.is_empty());
-        assert!(!planned.is_curable());
-    }
-
-    #[test]
     fn one_tool_clearing_several_gaps_is_one_offer_with_the_complete_claim() {
         let a = Audience::restricted([ReaderId::new("a")]);
         let send = ToolAnnotation {
@@ -2028,12 +2178,9 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
-                label: LabelRequirements {
-                    trust_floor: None,
-                    audience: vec![AudienceRequirement::Cap(DeclaredAudience::literal(a.clone()))],
-                },
                 history: vec![
                     HistoryRequirement::Prior(EffectKind::new("backup.done")),
                     HistoryRequirement::Prior(EffectKind::new("receipt")),
@@ -2047,9 +2194,10 @@ mod tests {
             tags: vec![],
             delta: Delta {
                 trust: None,
-                audience: Some(DeltaAudience::Static(DeclaredAudience::literal(a.clone()))),
+                audience: Some(DeltaAudience::Static(DeclaredAudience::literal(a))),
             },
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::new([EffectKind::new("backup.done"), EffectKind::new("receipt")]).unwrap(),
             requires: Requires::default(),
         };
@@ -2068,9 +2216,6 @@ mod tests {
             vec![redispatch(
                 "fixer",
                 vec![
-                    Gap::Cap {
-                        cap: DeclaredAudience::literal(a)
-                    },
                     Gap::Prior(EffectKind::new("backup.done")),
                     Gap::Prior(EffectKind::new("receipt")),
                 ],
@@ -2086,6 +2231,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 label: LabelRequirements {
@@ -2129,6 +2275,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 label: LabelRequirements {
@@ -2220,6 +2367,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 label: LabelRequirements {
@@ -2261,6 +2409,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 label: LabelRequirements {
@@ -2309,6 +2458,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 label: LabelRequirements {
@@ -2403,6 +2553,7 @@ mod tests {
                 tags: tags(tool_tags),
                 delta,
                 parameters: crate::params::ToolParameters::open(),
+                forwards: Delta::NONE,
                 emits: EffectSet::default(),
                 requires: Requires::default(),
             }
@@ -2535,11 +2686,6 @@ mod tests {
                 "an includes gap reads the in-scope authority; the input sanitizer reads its transition against the value"
             );
             assert_eq!(
-                collect(&unconfined, &raw(vec![Gap::Cap { cap: group("team") }], false)),
-                atoms(&["press"]),
-                "a cap gap reads every tool's delta and no authority"
-            );
-            assert_eq!(
                 collect(
                     &unconfined,
                     &raw(
@@ -2608,6 +2754,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 label: LabelRequirements {
@@ -2724,6 +2871,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 history: vec![HistoryRequirement::NoPrior(EffectKind::new("spend"))],
@@ -2766,6 +2914,7 @@ mod tests {
             description: None,
             parameters: crate::params::ToolParameters::open(),
             delta: Delta::NONE,
+            forwards: Delta::NONE,
             emits: EffectSet::new(kinds.iter().copied().map(EffectKind::new)).expect("distinct generated effect kinds"),
             requires: Requires::default(),
         };
@@ -2793,6 +2942,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 history: vec![HistoryRequirement::NoPrior(EffectKind::new("email.sent"))],
@@ -2833,6 +2983,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 history: vec![HistoryRequirement::Prior(EffectKind::new("backup.done"))],
@@ -2845,6 +2996,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::new([EffectKind::new("backup.done")]).unwrap(),
             requires: Requires {
                 history: vec![HistoryRequirement::NoPrior(EffectKind::new("lock"))],
@@ -2884,6 +3036,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 label: LabelRequirements {
@@ -2934,6 +3087,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 label: LabelRequirements {
@@ -2990,6 +3144,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 label: LabelRequirements {
@@ -3053,6 +3208,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 label: LabelRequirements {
@@ -3126,6 +3282,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 label: LabelRequirements {
@@ -3167,6 +3324,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 label: LabelRequirements {
@@ -3183,6 +3341,7 @@ mod tests {
             tags: vec![],
             delta: crate::contract::Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::new([EffectKind::new("receipt")]).unwrap(),
             requires: Requires::default(),
         };
@@ -3220,6 +3379,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 history: vec![HistoryRequirement::Prior(EffectKind::new("receipt"))],
@@ -3232,6 +3392,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::new([EffectKind::new("receipt")]).unwrap(),
             requires: Requires {
                 label: LabelRequirements {
@@ -3279,6 +3440,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 attention: vec![MarkName::new("signoff"), MarkName::new("signoff")],
@@ -3322,6 +3484,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 label: LabelRequirements {
@@ -3369,6 +3532,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 label: LabelRequirements {
@@ -3394,6 +3558,215 @@ mod tests {
     }
 
     #[test]
+    fn a_narrowing_counts_the_tools_it_moves_to_sign_off_or_blocked() {
+        let alice = || DeclaredAudience::restricted([ReaderId::new("alice")]);
+        let insider = || DeclaredAudience::restricted([ReaderId::new("insider")]);
+        let tool = |name: &str, tags: &[&str], recipients: Vec<RecipientSpec>| ToolAnnotation {
+            description: Some("A test tool.".to_string()),
+            name: ToolName::new(name),
+            tags: tags.iter().map(|tag| TagName::new(*tag)).collect(),
+            delta: Delta::NONE,
+            forwards: Delta::NONE,
+            parameters: crate::params::ToolParameters::open(),
+            emits: EffectSet::default(),
+            requires: Requires {
+                label: LabelRequirements {
+                    trust_floor: None,
+                    audience: recipients.into_iter().map(AudienceRequirement::Includes).collect(),
+                },
+                ..Requires::default()
+            },
+        };
+        let to_alice = || vec![RecipientSpec::Static(alice())];
+        let emitting = |mut tool: ToolAnnotation, effect: &str| {
+            tool.emits = EffectSet::new([EffectKind::new(effect)]).expect("one effect");
+            tool
+        };
+        let registry = build(RegistryConfig {
+            trust_chain: chain(),
+            tools: declared(vec![
+                {
+                    let mut fetch = emitting(tool("fetch", &[], vec![]), "consumed");
+                    fetch.delta.audience = Some(DeltaAudience::Static(insider()));
+                    fetch
+                },
+                emitting(tool("approve", &[], vec![]), "approved"),
+                tool("read", &[], vec![]),
+                tool("read(scope:org)", &[], to_alice()),
+                tool("post", &["mail"], to_alice()),
+                tool("share", &["docs"], to_alice()),
+                tool("notify", &["docs", "mail"], to_alice()),
+                {
+                    let mut drain = tool("drain", &["mail"], to_alice());
+                    drain.requires.history = vec![HistoryRequirement::NoPrior(EffectKind::new("consumed"))];
+                    drain
+                },
+                {
+                    let mut gated = tool("gated", &[], vec![]);
+                    gated.requires.history = vec![HistoryRequirement::Prior(EffectKind::new("approved"))];
+                    gated
+                },
+                tool(
+                    "post(scope:any)",
+                    &["mail"],
+                    vec![RecipientSpec::Placeholder("to".to_string())],
+                ),
+                tool("reply", &[], vec![RecipientSpec::Placeholder("to".to_string())]),
+            ]),
+            authorities: vec![Authority {
+                name: AuthorityName::new("desk"),
+                mandate: Mandate {
+                    reader_ceiling: Some(alice()),
+                    ..Mandate::default()
+                },
+                scope: Scope {
+                    tags: vec![TagName::new("mail")],
+                },
+                hint: None,
+            }],
+            sanitizers: vec![Sanitizer {
+                name: SanitizerName::new("scrub"),
+                on: SanitizerPoints {
+                    input: true,
+                    output: false,
+                },
+                transition: DeclaredTransition::Audience {
+                    from_includes: insider(),
+                    to: DeclaredAudience::Public,
+                },
+                scope: Scope {
+                    tags: vec![TagName::new("docs")],
+                },
+                hint: None,
+            }],
+            audience: crate::audience::AudienceConfig::default(),
+            annotators: vec![],
+        });
+        let log = vec![opened(known(TRUSTED, Audience::public()))];
+        assert_eq!(
+            plan_of(&registry, &log, &call("fetch", json!({}))).narrowing_impact,
+            Some(NarrowingImpact {
+                tools: 5,
+                sign_off: 1,
+                blocked: 2,
+                recipient_checked: vec![ToolName::new("post"), ToolName::new("reply")],
+            }),
+            "post needs desk; read's org variant has no remedy, and drain's consumed is committed by accepting \
+             fetch; share and notify (an input hop through scrub), gated (a call to approve) and reply (its arguments) are \
+             not analysed; post's argument-named variant and reply check recipients the narrowed audience reduces"
+        );
+        let parts = crate::label::TestContext::default();
+        let trust_only = Narrowing {
+            from: known(TRUSTED, Audience::public()),
+            to: known(SUSPICIOUS, Audience::public()),
+        };
+        assert!(
+            narrowing_impact(
+                &registry,
+                &trust_only,
+                &EffectSet::default(),
+                None,
+                &|_| false,
+                &|_| false,
+                &parts.context(),
+            )
+            .is_none_or(|impact| impact.recipient_checked.is_empty()),
+            "a narrowing that keeps the audience moves no recipient check"
+        );
+        let narrowed = vec![opened(known(TRUSTED, Audience::restricted([ReaderId::new("insider")])))];
+        assert_eq!(
+            plan_of(&registry, &narrowed, &call("post", json!({}))).narrowing_impact,
+            None,
+            "a block that narrows nothing has no impact"
+        );
+    }
+
+    #[test]
+    fn a_tool_whose_own_narrowing_the_floor_refuses_is_not_promised_sign_off() {
+        let alice = || DeclaredAudience::restricted([ReaderId::new("alice")]);
+        let insider = || Audience::restricted([ReaderId::new("insider")]);
+        let tool = |name: &str, trust: Option<Trust>| ToolAnnotation {
+            description: Some("A test tool.".to_string()),
+            name: ToolName::new(name),
+            tags: vec![TagName::new("mail")],
+            delta: Delta { trust, audience: None },
+            forwards: Delta::NONE,
+            parameters: crate::params::ToolParameters::open(),
+            emits: EffectSet::default(),
+            requires: Requires {
+                label: LabelRequirements {
+                    trust_floor: None,
+                    audience: vec![AudienceRequirement::Includes(RecipientSpec::Static(alice()))],
+                },
+                ..Requires::default()
+            },
+        };
+        let registry = build(RegistryConfig {
+            trust_chain: chain(),
+            tools: declared(vec![
+                tool("post", None),
+                tool("lookup", Some(SUSPICIOUS)),
+                tool("audit", None),
+                {
+                    let mut spent = tool("audit(scope:org)", None);
+                    spent.requires.history = vec![HistoryRequirement::NoPrior(EffectKind::new("spent"))];
+                    spent
+                },
+            ]),
+            authorities: vec![Authority {
+                name: AuthorityName::new("desk"),
+                mandate: Mandate {
+                    reader_ceiling: Some(alice()),
+                    ..Mandate::default()
+                },
+                scope: Scope {
+                    tags: vec![TagName::new("mail")],
+                },
+                hint: None,
+            }],
+            sanitizers: vec![],
+            audience: crate::audience::AudienceConfig::default(),
+            annotators: vec![],
+        });
+        let narrowing = Narrowing {
+            from: known(TRUSTED, Audience::public()),
+            to: known(TRUSTED, insider()),
+        };
+        let parts = crate::label::TestContext::default();
+        let impact = |floor: Option<&Floor>| {
+            narrowing_impact(
+                &registry,
+                &narrowing,
+                &EffectSet::default(),
+                floor,
+                &|kind| kind == &EffectKind::new("spent"),
+                &|_| false,
+                &parts.context(),
+            )
+        };
+        assert_eq!(
+            impact(None),
+            Some(NarrowingImpact {
+                tools: 3,
+                sign_off: 2,
+                blocked: 0,
+                recipient_checked: vec![],
+            }),
+            "audit's org variant is blocked before and after, so its other variant's move is no news"
+        );
+        assert_eq!(
+            impact(Some(&Floor::new(known(TRUSTED, insider()), None))),
+            Some(NarrowingImpact {
+                tools: 3,
+                sign_off: 1,
+                blocked: 0,
+                recipient_checked: vec![],
+            }),
+            "under a trusted floor lookup's drop to suspicious never settles, before or after"
+        );
+    }
+
+    #[test]
     fn acceptance_plan_for_pure_narrowing() {
         let tool = ToolAnnotation {
             description: Some("A test tool.".to_string()),
@@ -3406,6 +3779,7 @@ mod tests {
                 )]))),
             },
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires::default(),
         };
@@ -3432,6 +3806,7 @@ mod tests {
             Some(ForkAdvice::Narrowing {
                 standing: FloorStanding::Unbound,
                 sanitized_return: false,
+                preserving_output: false,
             }),
             "a root with no return sanitizer registered is told a child can take the change, unsanitized"
         );
@@ -3445,6 +3820,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::new([EffectKind::new("db.deleted")]).unwrap(),
             requires: Requires {
                 history: vec![HistoryRequirement::Prior(EffectKind::new("backup.done"))],
@@ -3457,6 +3833,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::new([EffectKind::new("backup.done")]).unwrap(),
             requires: Requires::default(),
         };
@@ -3485,6 +3862,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 history: vec![HistoryRequirement::Prior(EffectKind::new("backup.done"))],
@@ -3497,6 +3875,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::new([EffectKind::new("backup.done")]).unwrap(),
             requires: Requires::default(),
         };
@@ -3533,6 +3912,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 history: vec![HistoryRequirement::Prior(EffectKind::new("backup.done"))],
@@ -3545,6 +3925,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::new([EffectKind::new("backup.done")]).unwrap(),
             requires: Requires {
                 label: LabelRequirements {
@@ -3580,6 +3961,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 history: vec![HistoryRequirement::Prior(EffectKind::new("email.sent"))],
@@ -3592,6 +3974,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::test_string_argument_schema("to"),
+            forwards: Delta::NONE,
             emits: EffectSet::new([EffectKind::new("email.sent")]).unwrap(),
             requires: Requires {
                 label: LabelRequirements {
@@ -3626,6 +4009,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 history: vec![HistoryRequirement::Prior(EffectKind::new("backup.done"))],
@@ -3653,6 +4037,7 @@ mod tests {
             tags: vec![TagName::new("payments")],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 attention: vec![MarkName::new("signoff")],
@@ -3694,6 +4079,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 attention: vec![MarkName::new("signoff")],
@@ -3730,6 +4116,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 attention: vec![MarkName::new("sentry-review")],
@@ -3742,6 +4129,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::default(),
             requires: Requires {
                 attention: vec![MarkName::new(MarkName::BLOCKED)],
@@ -3783,6 +4171,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::new([EffectKind::new("ka")]).unwrap(),
             requires: Requires {
                 history: vec![HistoryRequirement::Prior(EffectKind::new("kb"))],
@@ -3795,6 +4184,7 @@ mod tests {
             tags: vec![],
             delta: Delta::NONE,
             parameters: crate::params::ToolParameters::open(),
+            forwards: Delta::NONE,
             emits: EffectSet::new([EffectKind::new("kb")]).unwrap(),
             requires: Requires {
                 history: vec![HistoryRequirement::Prior(EffectKind::new("ka"))],
@@ -3831,16 +4221,8 @@ mod tests {
             Some(clause.readers().clone())
         }
 
-        fn intersect(a: &Audience, b: &Audience) -> Audience {
-            match (readers(a), readers(b)) {
-                (None, _) => b.clone(),
-                (_, None) => a.clone(),
-                (Some(a), Some(b)) => Audience::restricted(a.intersection(&b).cloned()),
-            }
-        }
-
-        fn within(audience: &Audience, cap: &Audience) -> bool {
-            match (readers(audience), readers(cap)) {
+        fn within(audience: &Audience, outer: &Audience) -> bool {
+            match (readers(audience), readers(outer)) {
                 (_, None) => true,
                 (None, Some(_)) => false,
                 (Some(a), Some(c)) => a.is_subset(&c),
@@ -3860,28 +4242,18 @@ mod tests {
                 }
                 Gap::NoPrior(kind) => authority.mandate.waivers.contains(kind),
                 Gap::Attention(mark) => authority.mandate.attends.covers(mark),
-                Gap::Prior(_) | Gap::Cap { .. } => false,
+                Gap::Prior(_) => false,
             })
         }
 
-        pub(super) fn direct_set(registry: &Registry, current: &Label, raw: &RawBlock) -> Vec<(ToolName, Vec<Gap>)> {
+        pub(super) fn direct_set(registry: &Registry, raw: &RawBlock) -> Vec<(ToolName, Vec<Gap>)> {
             let mut expected = Vec::new();
             for tool in registry.tools().filter_map(crate::contract::ToolDeclaration::declared) {
-                let narrowed = match &tool.delta {
-                    Delta {
-                        audience: Some(DeltaAudience::Static(delta)),
-                        ..
-                    } => Some(intersect(&current.audience, &Audience::of_declared(delta))),
-                    _ => None,
-                };
                 let clears: Vec<Gap> = raw
                     .requirement_gaps
                     .iter()
                     .filter(|gap| match gap {
                         Gap::Prior(kind) => tool.emits.contains(kind),
-                        Gap::Cap { cap } => narrowed
-                            .as_ref()
-                            .is_some_and(|audience| within(audience, &Audience::of_declared(cap))),
                         _ => false,
                     })
                     .cloned()
@@ -3964,26 +4336,18 @@ mod tests {
     fn a_requires() -> impl Strategy<Value = Requires> {
         (
             prop::option::of((0u8..2).prop_map(Trust::new)),
-            prop::option::of(small_audience()),
             an_includes(),
             prop::collection::vec(small_effect().prop_map(HistoryRequirement::Prior), 0..2),
             prop::collection::vec(small_effect().prop_map(HistoryRequirement::NoPrior), 0..2),
             prop::bool::ANY,
         )
-            .prop_map(|(floor, cap, includes, prior, no_prior, attend)| {
+            .prop_map(|(floor, includes, prior, no_prior, attend)| {
                 let mut history = prior;
                 history.extend(no_prior);
-                let mut audience = Vec::new();
-                if let Some(cap) = cap {
-                    audience.push(AudienceRequirement::Cap(DeclaredAudience::literal(cap)));
-                }
-                if let Some(includes) = includes {
-                    audience.push(includes);
-                }
                 Requires {
                     label: LabelRequirements {
                         trust_floor: floor,
-                        audience,
+                        audience: includes.into_iter().collect(),
                     },
                     history,
                     attention: if attend { vec![MarkName::new("m0")] } else { vec![] },
@@ -4004,6 +4368,7 @@ mod tests {
                 tags: vec![],
                 delta,
                 parameters: crate::params::test_string_argument_schema("to"),
+                forwards: Delta::NONE,
                 emits: EffectSet::new(emits).expect("a btree_set draw is distinct"),
                 requires,
             })
@@ -4171,7 +4536,7 @@ mod tests {
                 .collect();
             let expected = match coverable || raw.requirement_gaps.is_empty() {
                 true => Vec::new(),
-                false => reference::direct_set(&registry, &state.partial(), &raw),
+                false => reference::direct_set(&registry, &raw),
             };
             prop_assert_eq!(offered, expected);
         }
@@ -4307,20 +4672,10 @@ mod tests {
                     HistoryRequirement::NoPrior(_) => None,
                 })
                 .collect();
-            let has_cap = contract
-                .requires.audience_requirements().iter()
-                .any(|requirement| matches!(requirement, AudienceRequirement::Cap(DeclaredAudience::Union(_))));
             let redispatches = registry
                 .tools()
                 .filter_map(ToolDeclaration::declared)
-                .filter(|candidate| {
-                    candidate.emits.iter().any(|kind| priors.contains(kind))
-                        || (has_cap
-                            && matches!(
-                                candidate.delta.audience.as_ref(),
-                                Some(DeltaAudience::Static(DeclaredAudience::Union(_)) | DeltaAudience::Selector(_))
-                            ))
-                })
+                .filter(|candidate| candidate.emits.iter().any(|kind| priors.contains(kind)))
                 .count() as u128;
             bound = bound.saturating_add(redispatches);
 
@@ -4412,7 +4767,7 @@ mod tests {
                         .is_some_and(|c| decided(Audience::of_declared(c).includes(recipients, &parts.context()))),
                     Gap::NoPrior(kind) => scoped && authority.mandate.waivers.contains(kind),
                     Gap::Attention(mark) => authority.mandate.attends.covers(mark),
-                    Gap::Prior(_) | Gap::Cap { .. } => false,
+                    Gap::Prior(_) => false,
                 }
             };
             let per_gap: Vec<Vec<&Authority>> = raw.requirement_gaps.iter()
@@ -4472,7 +4827,7 @@ mod tests {
                         let sb: std::collections::BTreeSet<_> = b.waivers.iter().collect();
                         inclusion(sa.is_subset(&sb), sb.is_subset(&sa))
                     }
-                    Gap::Attention(_) | Gap::Prior(_) | Gap::Cap { .. } => Some(O::Equal),
+                    Gap::Attention(_) | Gap::Prior(_) => Some(O::Equal),
                 }
             };
             let precedes = |a: &Vec<(AuthorityName, Vec<Gap>)>, b: &Vec<(AuthorityName, Vec<Gap>)>| -> bool {

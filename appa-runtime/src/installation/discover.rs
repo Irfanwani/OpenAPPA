@@ -28,9 +28,9 @@ pub(crate) fn servers(host: Host, cwd: &Path) -> BTreeSet<Namespace> {
             });
             claude_code_servers(config.as_deref(), &project_root(cwd))
         }
-        // kagent and embedding hosts keep their own inventories. amppa does not
+        // kagent and embedding hosts keep their own inventories. Source plugins do not
         // participate in marketplace installation or automatic battery discovery.
-        Host::Kagent | Host::Amp | Host::Embedded => BTreeSet::new(),
+        Host::Kagent | Host::Amp | Host::OpenCode | Host::Embedded => BTreeSet::new(),
     }
 }
 
@@ -151,7 +151,7 @@ pub(crate) fn detected(host: Host, available: &[(PackageName, Battery)], search:
                 .map(|(name, _)| name.clone())
                 .collect()
         }
-        Host::Kagent | Host::Amp | Host::Embedded => Vec::new(),
+        Host::Kagent | Host::Amp | Host::OpenCode | Host::Embedded => Vec::new(),
     }
 }
 
@@ -211,7 +211,7 @@ pub(crate) fn coverage(
     servers: &BTreeSet<Namespace>,
     batteries: &[(PackageName, Battery)],
     included: &BTreeSet<String>,
-    bindings: &crate::config::ServerBindings,
+    bindings: &crate::config::aliases::NamespaceBindings,
 ) -> Coverage {
     let bound_to = |namespace: &Namespace| bindings.get(namespace.as_str()).map(Vec::as_slice);
     let bound_to_server = |namespace: &Namespace, server: &Namespace| {
@@ -333,7 +333,8 @@ mod tests {
         (
             PackageName::parse(name).unwrap(),
             Battery {
-                policy: RelativePath::parse("appa.toml").unwrap(),
+                base: RelativePath::parse("appa.toml").unwrap(),
+                targets: None,
                 hosts: vec![Host::ClaudeCode],
                 namespaces: namespaces.iter().map(|text| namespace(text)).collect(),
                 helpers: vec![],
@@ -362,8 +363,8 @@ mod tests {
         names.iter().map(|name| (*name).to_owned()).collect()
     }
 
-    fn bindings(pairs: &[(&str, &str)]) -> crate::config::ServerBindings {
-        let mut bindings = crate::config::ServerBindings::new();
+    fn bindings(pairs: &[(&str, &str)]) -> crate::config::aliases::NamespaceBindings {
+        let mut bindings = crate::config::aliases::NamespaceBindings::new();
         for (namespace, server) in pairs {
             bindings
                 .entry((*namespace).to_owned())

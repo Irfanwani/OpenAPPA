@@ -1422,6 +1422,7 @@ mod tests {
             call.digest(),
             crate::contract::ProducedAnnotation {
                 delta: crate::contract::Delta::NONE,
+                forwards: crate::contract::Delta::NONE,
                 emits: EffectSet::default(),
                 requires: crate::contract::Requires::default(),
             },
@@ -1523,10 +1524,10 @@ mod tests {
                 trajectory: traj(parent),
                 fork: fork.clone(),
                 snapshot,
-                return_policy: ReturnPolicy {
+                return_policy: ReturnPolicy::Crossing(crate::fact::CrossingReturn {
                     floor: Label::top(),
                     sanitizer: None,
-                },
+                }),
                 kind: crate::transition::SpawnKind::Single,
             },
             Fact::ForkOpened {

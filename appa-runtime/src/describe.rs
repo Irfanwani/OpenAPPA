@@ -424,6 +424,7 @@ fn describe_policy_value(
 pub(crate) fn served(adapter: AdapterName) -> appa_runtime_api::Adapter {
     match adapter {
         AdapterName::Amp => appa_adapter_amp::adapter(),
+        AdapterName::OpenCode => appa_adapter_opencode::adapter(),
         AdapterName::ClaudeCode => appa_adapter_claude_code::adapter(),
         AdapterName::Kagent => appa_adapter_kagent::adapter(),
         AdapterName::Embedded => unreachable!("--adapter names a served adapter"),
@@ -443,12 +444,8 @@ pub fn render(path: &Path, battery_dirs: &[PathBuf], adapter: AdapterName, sessi
     let mut served_policy = None;
     let served = served(adapter);
     if let Some(loaded) = &loaded {
-        let resolved = crate::tool_validation::resolve(
-            loaded.policy_file().value(),
-            served,
-            &loaded.inventory,
-            &loaded.server_aliases,
-        );
+        let resolved =
+            crate::tool_validation::resolve(loaded.policy_file().value(), served, &loaded.inventory, &loaded.aliases);
         let authored_tools = policy.tools.clone();
         served_policy = describe_policy_value(&resolved.policy, Bindings::Loaded(&loaded.externals), &mut policy);
         policy.tools = authored_tools;

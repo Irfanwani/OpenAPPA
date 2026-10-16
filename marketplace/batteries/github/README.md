@@ -2,13 +2,36 @@
 
 Rules for the GitHub MCP server (`https://api.githubcopilot.com/mcp/`)
 with its default tool sets: your profile, repositories, issues, pull
-requests, and user search. Shared by the Claude Code and kagent plugins.
+requests, and user search. Shared by the Claude Code, kagent, and OpenCode plugins.
 Installing the battery adds its policy include; it does not create the
-MCP connection or enable tools in either host.
+MCP connection or enable tools in the host.
+
+## Targets
+
+`appa.toml` is the base policy; a deployment composes one target policy
+over it, whose rules run first.
+
+- **single-user** (`single-user.toml`) — one person's token, as this
+  README describes: the annotators, the context provider, and the
+  audience source naming people by verified email.
+- **multi-user** (`multi-user.toml`) — a GitHub App installation token,
+  with no viewer. The same rules over `context-multi-user.py` and
+  `audience-source-multi-user.py`, which name every person `github:<id>`
+  by numeric account id. The root config must map those ids to people:
+
+  ```toml
+  [externals.audience.host-members]
+  readers = { "github:583231" = "ana@corp.example" }
+  ```
+
+- **base alone** — no helper and no lookup: a read of one repository
+  enters `suspicious` and stays with the viewer (`self`), and a write
+  into one needs trusted data everyone may see. The parent issue
+  `sub_issue_write` returns is labelled as such a read is.
 
 ## Files
 
-**`appa.toml`** — the rules, in six groups. Each rule names its tool by
+**`appa.toml`**, **`single-user.toml`** — the rules, in six groups. Each rule names its tool by
 the canonical tool id `mcp/github/<tool>`.
 
 *Who am I* — `get_me` returns the viewer's own profile, nothing written
@@ -58,6 +81,16 @@ mapping the enterprise's members can relax that. A summary of a private
 repository's issues can go back into that repository's issues and not
 into a public one.
 
+A write's result is labelled only when it returns stored text beyond
+the call's own arguments. `sub_issue_write` returns the parent issue its
+`issue_number` names, title and body included: the result gets the
+repository's audience, as an `issue_read` of that issue does, and keeps
+the session's trust only when the `github` context answer for that issue
+shows the same authorship an `issue_read` needs. Without that answer it
+is `suspicious`, on a private repository too. Every other write returns
+identifiers, URLs, SHAs, or a fixed message, and its `delta` is empty.
+The annotator's mandate admits `suspicious` for this.
+
 *Writes that name no existing repository* — `create_repository` runs
 with trusted public data.
 
@@ -69,7 +102,7 @@ Gists, Notifications, Projects, security alerts) are not listed here.
 A tool the policy does not name is blocked; add rules for them in your
 root config if you enable those sets.
 
-**`repository-visibility.py`** — the two annotators, one script. A
+**`repository_visibility.py`** — the two annotators, one script. A
 consult carries the call's `owner` and `repo` and the `github` context
 entry; the script reads `GET /repos/{owner}/{repo}` for the visibility
 and whether the repository is a fork, and answers the contract for that
@@ -174,7 +207,7 @@ lookup resolves a `github:<login>` member the same way and answers
 `null` for a login GitHub does not know.
 
 The battery binds the source itself, under `[externals.audience.github]`
-in `appa.toml`, and declares the four templates above as its
+in `single-user.toml`, and declares the four templates above as its
 `selectors`. Audience mappings are root-only, so the root config maps
 the chain onto them:
 
@@ -229,7 +262,7 @@ into it accept what they may see.
 ## Change the behaviour
 
 To make a write ask a person first, add a root rule for that tool with
-`attention = ["hitl"]` in its `requires`. To treat a search of public
+`attention = ["human-approval"]` in its `requires`. To treat a search of public
 repositories as public by its query, or one repository's content as
 `internal` instead of its collaborators, add a root rule naming it
 (`query:`, `repo:`) or its whole organisation (`owner:`). Root rules run

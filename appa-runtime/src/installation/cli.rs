@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use appa_package::generation::{ArtifactDigest, Commit, Generation, Platform};
-use appa_package::{Battery, Namespace, PackageKind, PackageName, Role};
+use appa_package::{Battery, BatteryTarget, Namespace, PackageKind, PackageName, Role};
 use clap::Args;
 use serde::Serialize;
 
@@ -57,7 +57,7 @@ pub struct Bundle {
 )]
 pub struct Install {
     /// Host plugin to install. Omitted, the catalog is listed instead.
-    #[arg(value_parser = ["claude-code", "kagent"])]
+    #[arg(value_parser = ["claude-code", "kagent", "opencode"])]
     name: Option<String>,
     /// Kagent agent runtimes to prepare; both on first install, otherwise retained.
     #[arg(long, value_enum)]
@@ -110,7 +110,7 @@ pub struct BatteryRemove {
 )]
 pub struct PluginRemove {
     /// Host plugin whose installer-owned registration is removed.
-    #[arg(value_parser = ["claude-code", "kagent"])]
+    #[arg(value_parser = ["claude-code", "kagent", "opencode"])]
     name: String,
     /// Also stop the runtime and delete the default deployment's data and config directories.
     #[arg(long)]
@@ -119,13 +119,16 @@ pub struct PluginRemove {
     target: Target,
 }
 
-pub fn remove_plugin(args: PluginRemove) -> ExitCode {
+pub fn remove_plugin(mut args: PluginRemove) -> ExitCode {
     begin(&args.target);
     if args.purge {
         return purge_plugin(args);
     }
     let result = (|| {
         let path = plugin_path(&args.target, &args.name)?;
+        if args.name == "opencode" {
+            args.target.config = Some(path.clone());
+        }
         match Installation::inspect(&path) {
             Ok(None) => {
                 return Ok((None, serde_json::json!({"plugin":args.name,"state":"unchanged"})));
@@ -215,6 +218,7 @@ pub fn install_battery(mut args: BatteryInstall) -> ExitCode {
     let mut seen = std::collections::BTreeSet::new();
     args.names.retain(|name| seen.insert(name.clone()));
     let result = (|| {
+        let battery_target = crate::config::battery_target()?;
         if !args.server.is_empty() && args.names.len() != 1 {
             return Err(InstallError::Invalid(
                 "--server binds one battery's namespace; install that battery on its own".into(),
@@ -282,7 +286,10 @@ pub fn install_battery(mut args: BatteryInstall) -> ExitCode {
         if !args.server.is_empty() {
             let battery = &batteries[0];
             if battery.namespaces.len() != 1 {
-                return Err(InstallError::Invalid("this battery has multiple namespaces; configure server_aliases explicitly in the deployment config".into()));
+                return Err(InstallError::Invalid(
+                    "this battery has multiple namespaces; configure aliases.mcp explicitly in the deployment config"
+                        .into(),
+                ));
             }
             text = edit::bind_servers(&text, battery.namespaces[0].as_str(), &args.server)?;
         }
@@ -290,7 +297,7 @@ pub fn install_battery(mut args: BatteryInstall) -> ExitCode {
         installation.commit_installation(Some(&before), text.as_bytes(), &selection)?;
         let prepared = prepared_directory(&installation)?;
         let mut result = battery_result(&args.names, "installed", prepared);
-        result["setup"] = setup_notices(args.names.iter().zip(&batteries), credential_is_set);
+        result["setup"] = setup_notices(args.names.iter().zip(&batteries), battery_target, credential_is_set);
         Ok((Some(Version::of(selection.generation())), result))
     })();
     finish(&args.target, "battery.install".into(), result)
@@ -337,22 +344,30 @@ const START_OVER_COMMANDS: [&str; 2] = [
 /// refusal. Batteries with nothing to say are absent.
 fn setup_notices<'a>(
     batteries: impl IntoIterator<Item = (&'a PackageName, &'a Battery)>,
+    target: BatteryTarget,
     is_set: impl Fn(&str) -> bool,
 ) -> serde_json::Value {
     let notices: Vec<serde_json::Value> = batteries
         .into_iter()
-        .filter(|(_, battery)| !battery.credentials.is_empty() || !battery.setup.is_empty())
         .map(|(name, battery)| {
-            let credentials: Vec<serde_json::Value> = battery
-                .credentials
-                .iter()
+            (
+                name,
+                battery,
+                battery.credentials_for(target),
+                battery.setup_steps(target),
+            )
+        })
+        .filter(|(_, _, credentials, setup)| !credentials.is_empty() || !setup.is_empty())
+        .map(|(name, battery, credentials, setup)| {
+            let credentials: Vec<serde_json::Value> = credentials
+                .into_iter()
                 .map(|variable| serde_json::json!({"variable": variable, "set": is_set(variable)}))
                 .collect();
             serde_json::json!({
                 "battery": name.as_str(),
                 "credentials": credentials,
                 "benefit": battery.benefit,
-                "setup": battery.setup,
+                "setup": setup,
             })
         })
         .collect();
@@ -620,12 +635,13 @@ fn archive_digest(value: &str) -> Result<ArtifactDigest, String> {
     ArtifactDigest::parse(&format!("sha256:{value}")).map_err(|error| error.to_string())
 }
 
-pub fn install(args: Install) -> ExitCode {
+pub fn install(mut args: Install) -> ExitCode {
     let Some(name) = args.name.clone() else {
         return orient(PackageKind::Plugin, &args.target);
     };
     begin(&args.target);
     let result = (|| {
+        let battery_target = crate::config::battery_target()?;
         if args.runtime.is_some() && name != "kagent" {
             return Err(InstallError::Invalid("--runtime applies only to kagent".into()));
         }
@@ -635,6 +651,9 @@ pub fn install(args: Install) -> ExitCode {
             ));
         }
         let path = plugin_path(&args.target, &name)?;
+        if name == "opencode" {
+            args.target.config = Some(path.clone());
+        }
         if path.exists() {
             crate::config::Config::load_local(&path, &[]).map_err(invalid)?;
         }
@@ -651,17 +670,18 @@ pub fn install(args: Install) -> ExitCode {
         let current = installation.selection()?;
         let platform = Platform::current()
             .ok_or_else(|| InstallError::Invalid("this platform has no published runtime binary".into()))?;
-        let claude = name == "claude-code"
-            || current
-                .as_ref()
-                .is_some_and(|selection| selection.plugins.contains("claude-code"));
+        let native = name == "claude-code"
+            || name == "opencode"
+            || current.as_ref().is_some_and(|selection| {
+                selection.plugins.contains("claude-code") || selection.plugins.contains("opencode")
+            });
         let kagent = name == "kagent"
             || current
                 .as_ref()
                 .is_some_and(|selection| selection.plugins.contains("kagent"));
-        let requirements = match (claude, kagent) {
+        let requirements = match (native, kagent) {
             (true, true) => Requirements::Both(platform),
-            (true, false) => Requirements::Claude(platform),
+            (true, false) => Requirements::Native(platform),
             (false, true) => Requirements::Kagent,
             (false, false) => unreachable!("parser requires a supported plugin"),
         };
@@ -778,6 +798,7 @@ pub fn install(args: Install) -> ExitCode {
             &included_now,
             &bindings,
             args.target.config.as_deref(),
+            battery_target,
         );
         let mut result = if name == "kagent" {
             let installed = installation
@@ -808,8 +829,9 @@ fn coverage_result(
     servers: &std::collections::BTreeSet<Namespace>,
     available: &[(PackageName, Battery)],
     included: &std::collections::BTreeSet<String>,
-    bindings: &crate::config::ServerBindings,
+    bindings: &crate::config::aliases::NamespaceBindings,
     config: Option<&Path>,
+    target: BatteryTarget,
 ) -> serde_json::Value {
     let coverage = discover::coverage(servers, available, included, bindings);
     // A suggested battery's setup is named beside the command that includes
@@ -824,6 +846,7 @@ fn coverage_result(
                 .find(|(name, _)| name == suggested)
                 .map(|(name, battery)| (name, battery))
         }),
+        target,
         credential_is_set,
     );
     let suggestions: Vec<serde_json::Value> = coverage
@@ -869,7 +892,14 @@ pub(crate) fn render_server_coverage(
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .unwrap_or_default();
     let (included, bindings) = includes::batteries(&text)?;
-    let result = coverage_result(servers, &available, &included, &bindings, Some(config));
+    let result = coverage_result(
+        servers,
+        &available,
+        &included,
+        &bindings,
+        Some(config),
+        crate::config::battery_target()?,
+    );
     render_coverage(output, style, &result).map_err(|error| super::io("write", Path::new("stdout"), error))
 }
 
@@ -896,6 +926,9 @@ pub(crate) fn is_published_build() -> bool {
 }
 
 fn plugin_path(target: &Target, plugin: &str) -> Result<PathBuf, InstallError> {
+    if plugin == "opencode" && target.config.is_none() {
+        return super::opencode::config_path();
+    }
     if plugin == "kagent" && target.config.is_none() {
         return Err(InstallError::Invalid(
             "kagent requires --config <deployment/appa.toml> (or APPA_CONFIG); no cluster is selected automatically"
@@ -1414,7 +1447,10 @@ fn finish(
             // The mark, then what to do next: the install is done being
             // reported, so this is the one moment it is not in the way.
             .and_then(|()| writeln!(output, "\n{}", crate::mascot::happy(style)))
-            .and_then(|()| writeln!(output, "{}\n", guide_next(style)))
+            .and_then(|()| match plugin {
+                "opencode" => writeln!(output, "Run `appa opencode setup --config {}` from the project to configure, then start a fresh OpenCode session.\n", shell_word(&receipt.deployment.display().to_string())),
+                _ => writeln!(output, "{}\n", guide_next(style)),
+            })
         }
     } else if let Some(batteries) = receipt.result.as_ref().and_then(|result| result.get("batteries")) {
         (|| {
@@ -1530,7 +1566,8 @@ mod tests {
     #[test]
     fn setup_notices_name_each_credential_the_benefit_and_the_steps() {
         let battery = |credentials: &[&str], benefit: Option<&str>, setup: &[&str]| Battery {
-            policy: appa_package::RelativePath::parse("appa.toml").unwrap(),
+            base: appa_package::RelativePath::parse("appa.toml").unwrap(),
+            targets: Default::default(),
             hosts: vec![appa_package::Host::ClaudeCode],
             namespaces: vec![],
             helpers: vec![],
@@ -1557,9 +1594,11 @@ mod tests {
             (&notion, battery(&[], Some("Rules for every Notion tool."), &[])),
         ];
 
-        let setup = setup_notices(batteries.iter().map(|(name, battery)| (*name, battery)), |variable| {
-            variable == "APPA_PROVIDER_LINEAR_TOKEN"
-        });
+        let setup = setup_notices(
+            batteries.iter().map(|(name, battery)| (*name, battery)),
+            BatteryTarget::SingleUser,
+            |variable| variable == "APPA_PROVIDER_LINEAR_TOKEN",
+        );
         assert_eq!(
             setup[0]["setup"],
             serde_json::json!(["Run `gh auth login`.", "Or set a token."])
@@ -1577,6 +1616,39 @@ mod tests {
         assert!(rendered.contains("linear reads APPA_PROVIDER_LINEAR_TOKEN (set in this shell)."));
         assert!(!rendered.contains("otion"));
         assert_eq!(rendered.lines().filter(|line| line.contains("reads")).count(), 2);
+    }
+
+    /// A deployment's notice names its own target's steps.
+    #[test]
+    fn setup_notices_follow_the_deployment_target() {
+        let target_policy = |setup: Option<&str>| appa_package::TargetPolicy {
+            policy: appa_package::RelativePath::parse("target.toml").unwrap(),
+            audiences: vec![],
+            credentials: vec![],
+            readiness: None,
+            setup: setup.map(|step| vec![step.to_owned()]),
+        };
+        let battery = Battery {
+            base: appa_package::RelativePath::parse("appa.toml").unwrap(),
+            targets: Some(appa_package::TargetPolicies {
+                single_user: target_policy(None),
+                multi_user: target_policy(Some("Install the App.")),
+            }),
+            hosts: vec![appa_package::Host::ClaudeCode],
+            namespaces: vec![],
+            helpers: vec![],
+            audiences: vec![],
+            credentials: vec![],
+            benefit: None,
+            setup: vec!["Make a token.".to_owned()],
+            readiness: None,
+            detect: vec![],
+        };
+        let github = PackageName::parse("github").unwrap();
+        let steps = |target| setup_notices([(&github, &battery)], target, |_| false)[0]["setup"].clone();
+
+        assert_eq!(steps(BatteryTarget::MultiUser), serde_json::json!(["Install the App."]));
+        assert_eq!(steps(BatteryTarget::SingleUser), serde_json::json!(["Make a token."]));
     }
 
     /// Every battery without a binding goes in one command, so the person

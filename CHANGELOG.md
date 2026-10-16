@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.34.0](https://github.com/archestra-ai/OpenAPPA/compare/v0.33.0...v0.34.0) (2026-10-14)
+
+
+### Features
+
+* **databricks:** split the battery into a base and target policies ([#633](https://github.com/archestra-ai/OpenAPPA/issues/633)) ([e0bb190](https://github.com/archestra-ai/OpenAPPA/commit/e0bb190f8f0e89b6ce9649a79035fbd2df7f13fc))
+* **github:** readiness and setup per deployment target ([#630](https://github.com/archestra-ai/OpenAPPA/issues/630)) ([47c01d9](https://github.com/archestra-ai/OpenAPPA/commit/47c01d99b799069846357ec9b1c0f4aebb0842fc))
+* **github:** split the battery into a base and target policies ([#629](https://github.com/archestra-ai/OpenAPPA/issues/629)) ([21146af](https://github.com/archestra-ai/OpenAPPA/commit/21146afff102b61bc3417ec56e948fa8bc272a95))
+* **huggingface:** split the battery into a base and target policies ([#632](https://github.com/archestra-ai/OpenAPPA/issues/632)) ([877d982](https://github.com/archestra-ai/OpenAPPA/commit/877d9828a6758b12873e5edff3d8fae10c21bb7b))
+* **linear:** split the battery into a base and target policies ([#634](https://github.com/archestra-ai/OpenAPPA/issues/634)) ([47be8e8](https://github.com/archestra-ai/OpenAPPA/commit/47be8e80f07887e96d5a71322e9b7e762cbe4eec))
+* **monday:** split the battery into a base and target policies ([#631](https://github.com/archestra-ai/OpenAPPA/issues/631)) ([b8d005e](https://github.com/archestra-ai/OpenAPPA/commit/b8d005efe3b5468ae9212e469a279033ad118569))
+* **package:** battery base and per-target add-ons ([#619](https://github.com/archestra-ai/OpenAPPA/issues/619)) ([fec1bcd](https://github.com/archestra-ai/OpenAPPA/commit/fec1bcd29d1906655c638d6eb8efa9512ce697a1))
+* **package:** check a targeted battery's base stands alone ([#627](https://github.com/archestra-ai/OpenAPPA/issues/627)) ([614af74](https://github.com/archestra-ai/OpenAPPA/commit/614af744e4474021ac96779cce53c4d6b3a1e01c))
+* **runtime:** load each battery's policy for the deployment target ([#622](https://github.com/archestra-ai/OpenAPPA/issues/622)) ([b4e3915](https://github.com/archestra-ai/OpenAPPA/commit/b4e3915539ac2fbcc4cd49a9eadb4c50dd2a0a13))
+* **runtime:** run batteries' multi-user target on the kagent shared runtime ([#639](https://github.com/archestra-ai/OpenAPPA/issues/639)) ([b3b9896](https://github.com/archestra-ai/OpenAPPA/commit/b3b9896786aaa12c9c811f2bd30a0b6f509a1a1b))
+
+
+### Documentation
+
+* **opencode:** align MCP guidance with direct tools ([#643](https://github.com/archestra-ai/OpenAPPA/issues/643)) ([b830891](https://github.com/archestra-ai/OpenAPPA/commit/b8308911ac4dd8e645258936652d01eb0c57fcba))
+* **opencode:** configure direct MCP tool guidance ([b830891](https://github.com/archestra-ai/OpenAPPA/commit/b8308911ac4dd8e645258936652d01eb0c57fcba))
+
+## [0.33.0](https://github.com/archestra-ai/OpenAPPA/compare/v0.32.0...v0.33.0) (2026-10-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* **engine:** check requirements against what a call forwards ([#640](https://github.com/archestra-ai/OpenAPPA/issues/640))
+
+### Features
+
+* **engine:** check requirements against what a call forwards ([#640](https://github.com/archestra-ai/OpenAPPA/issues/640)) ([ea7f8d2](https://github.com/archestra-ai/OpenAPPA/commit/ea7f8d24835a819a684ca9da1beb002f1ee05adb))
+* **engine:** show what accepting a narrowing restricts ([#636](https://github.com/archestra-ai/OpenAPPA/issues/636)) ([f63b4ff](https://github.com/archestra-ai/OpenAPPA/commit/f63b4ff9f44607660a5dc4d824a764fa2d7da7b1))
+* **eventlog:** replace advisory locks with row locks, receipt leases and incremental views ([#637](https://github.com/archestra-ai/OpenAPPA/issues/637)) ([d349053](https://github.com/archestra-ai/OpenAPPA/commit/d3490532c492d955340e525d7df4ac1ec0288117))
+* **opencode:** add AppenCode v1 for OpenCode V2 ([#628](https://github.com/archestra-ai/OpenAPPA/issues/628)) ([6d29f14](https://github.com/archestra-ai/OpenAPPA/commit/6d29f14eb2f5033c3bad595d85d6883f310d43d6))
+* **opencode:** add checked foreground subagents ([#635](https://github.com/archestra-ai/OpenAPPA/issues/635)) ([82f3011](https://github.com/archestra-ai/OpenAPPA/commit/82f3011a88f4db28cce8593a13d1ce6bed225919))
+
+
+### Bug Fixes
+
+* **battery:** let archestra yell run in any session ([#624](https://github.com/archestra-ai/OpenAPPA/issues/624)) ([c0f3a66](https://github.com/archestra-ai/OpenAPPA/commit/c0f3a668845375cefe6c884212c2b2197fc373ed))
+* **runtime:** distinguish a named fetch from outgoing data ([#638](https://github.com/archestra-ai/OpenAPPA/issues/638)) ([aac8c2b](https://github.com/archestra-ai/OpenAPPA/commit/aac8c2b3c34c9bad7f08793e2d226d4791724a43))
+* **runtime:** name the blocked tool and the accepted change in remedy feedback ([#623](https://github.com/archestra-ai/OpenAPPA/issues/623)) ([c3607f0](https://github.com/archestra-ai/OpenAPPA/commit/c3607f083200d318ed497343ba9fc08fabcdcca8))
+
 ## [0.32.0](https://github.com/archestra-ai/OpenAPPA/compare/v0.31.1...v0.32.0) (2026-10-13)
 
 

@@ -2,6 +2,7 @@
 //! external bindings. The harness adapter is a CLI flag on the
 //! binary, not configuration.
 
+pub mod aliases;
 pub mod edit;
 
 use std::collections::BTreeMap;
@@ -11,11 +12,12 @@ use std::time::Duration;
 use appa_engine::audience::{DeclaredTemplate, SelectorTemplate, SourceRegistration, well_formed_reader};
 use appa_engine::label::{ChainAudience, ReaderId};
 use appa_engine::names::ProviderName;
+use appa_package::BatteryTarget;
 use appa_policy::AnnotatorBuiltin;
+use appa_runtime_api::PrincipalSource;
 use serde::Deserialize;
 
-/// Each policy namespace bound to the connection identities the host reports for it.
-pub(crate) type ServerBindings = BTreeMap<String, Vec<String>>;
+pub use aliases::{AliasFamily, Aliases};
 
 /// Each child-credential variable a battery's helpers read, bound to the key the host's
 /// own store holds its value under. The runtime never looks a key up; see
@@ -51,8 +53,7 @@ pub struct Config {
     pub(crate) credential_store: Option<crate::credentials::CredentialStore>,
     keys: Keys,
     policy: PolicyFile,
-    /// Each policy namespace bound to the connection identities the host reports for it.
-    pub(crate) server_aliases: ServerBindings,
+    pub(crate) aliases: Aliases,
     credentials: CredentialBindings,
     pub(crate) inventory: appa_runtime_api::inventory::ToolInventory,
     pub externals: Externals,
@@ -98,7 +99,7 @@ pub(crate) const RUNTIME_VARIABLE_PREFIX: &str = "APPA_";
 
 /// The namespace a `command` external's own credential lives in — a battery's provider
 /// token, which the runtime never reads and never sends. A child inherits nothing of the
-/// runtime's namespace by default; the one variable its binding names is put back, and only
+/// runtime's namespace by default; the variables its binding names are put back, and only
 /// from this namespace, so a credential reaches the one command that reads it and no other.
 /// A `url` binding's `token_env` may not name a variable here, so the passthrough cannot
 /// become a way to hand a subprocess a secret this runtime holds.
@@ -154,7 +155,8 @@ impl HostDefaults {
 
 /// Where the embedding host answers an `archestra` consult, and the bearer token it
 /// expects. Each attempt is one `POST` of `{"system", "input", "schema"}` — the rendered
-/// model prompt — whose 2xx body is the answer object itself. The URL follows every
+/// model prompt — plus, for a consult made on a trajectory, `"attribution": {"root",
+/// "trajectory", "call_id"?}`. The 2xx body is the answer object itself. The URL follows every
 /// endpoint's rules: `https` anywhere, cleartext `http` only to loopback.
 #[cfg(feature = "archestra")]
 #[derive(Debug, Clone)]
@@ -174,15 +176,52 @@ impl ArchestraEndpoint {
 }
 
 /// One battery a host composes under its root document: the name the host lists it
-/// under, which is what errors and [`Config::included_batteries`] say, its `appa.toml`
-/// text, and the runtime variables its externals may read. A battery is another
+/// under, which is what errors and [`Config::included_batteries`] say, its base policy
+/// text, the text of its target policy for the host's deployment target when it has
+/// one, and the runtime variables its externals may read. A battery is another
 /// author's text: whatever `token_env` it names, the runtime would send to the URL
 /// beside it, so a variable the host did not grant is refused.
 #[derive(Debug, Clone, Copy)]
 pub struct HostedBattery<'a> {
     pub name: &'a str,
-    pub policy: &'a str,
+    pub base: &'a str,
+    pub target: Option<&'a str>,
     pub token_env: &'a [&'a str],
+}
+
+/// The variable that names the deployment target a file-loaded runtime composes each
+/// battery for.
+pub const BATTERY_TARGET_VARIABLE: &str = "APPA_BATTERY_TARGET";
+
+/// The deployment target this process composes batteries for: single-user unless
+/// [`BATTERY_TARGET_VARIABLE`] names another.
+pub fn battery_target() -> Result<BatteryTarget, ConfigError> {
+    match std::env::var_os(BATTERY_TARGET_VARIABLE) {
+        None => Ok(BatteryTarget::SingleUser),
+        Some(value) => {
+            let value = value.to_string_lossy();
+            BatteryTarget::parse(&value).ok_or_else(|| ConfigError::InvalidBatteryTarget {
+                value: value.into_owned(),
+            })
+        }
+    }
+}
+
+/// The variable that opts a served runtime into reading a session's principal off the wire.
+pub const SESSION_PRINCIPAL_VARIABLE: &str = "APPA_SESSION_PRINCIPAL";
+
+/// Where this process reads a session principal from: nowhere unless
+/// [`SESSION_PRINCIPAL_VARIABLE`] names the wire.
+pub fn principal_source() -> Result<PrincipalSource, ConfigError> {
+    match std::env::var_os(SESSION_PRINCIPAL_VARIABLE) {
+        None => Ok(PrincipalSource::None),
+        Some(value) => {
+            let value = value.to_string_lossy();
+            PrincipalSource::parse(&value).ok_or_else(|| ConfigError::InvalidPrincipalSource {
+                value: value.into_owned(),
+            })
+        }
+    }
 }
 
 /// Why a host could not answer an include entry of a root document it composes with
@@ -620,14 +659,14 @@ pub enum AudienceImplementation {
     Readers(BTreeMap<ReaderId, ReaderId>),
 }
 
-/// A command binding's argv, the directory of the config that declared it, and the one
-/// `APPA_PROVIDER_*` variable its child inherits. The name is carried, never the value: the
-/// runtime forwards the variable at spawn and never reads the credential itself.
+/// A command binding's argv, the directory of the config that declared it, and the
+/// `APPA_PROVIDER_*` variables its child inherits. Names are carried, never values: the
+/// runtime forwards the variables at spawn and never reads the credentials itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolverCommand {
     pub argv: Vec<String>,
     pub cwd: PathBuf,
-    pub token_env: Option<String>,
+    pub token_env: Vec<String>,
 }
 
 pub const CLAUDE_CODE_BUILTIN: &str = AnnotatorBuiltin::ClaudeCode.wire_name();
@@ -723,11 +762,28 @@ pub enum ConfigError {
     TraversingInclude { path: String },
     #[error("the root config includes {path:?} more than once")]
     DuplicateInclude { path: String },
+    #[error("{BATTERY_TARGET_VARIABLE} is {value:?}, which is neither single-user nor multi-user")]
+    InvalidBatteryTarget { value: String },
+    #[error("{SESSION_PRINCIPAL_VARIABLE} is {value:?}, which is neither none nor wire")]
+    InvalidPrincipalSource { value: String },
+    #[error("cannot read the battery manifest {path}: {source}")]
+    UnreadableBatteryManifest {
+        path: String,
+        source: Box<appa_package::ManifestError>,
+    },
+    #[error(
+        "the root config includes {path:?}, a battery's target policy; include the battery's base, and {BATTERY_TARGET_VARIABLE} picks the target policy"
+    )]
+    TargetPolicyIncluded { path: String },
     #[error(
         "the root config includes {path:?}, which the host does not compose{}",
         reason.as_deref().map(|reason| format!(": {reason}")).unwrap_or_default()
     )]
     UnresolvedInclude { path: String, reason: Option<String> },
+    #[error("the document declares both [aliases] and [server_aliases]; bind mcp namespaces under aliases.mcp only")]
+    MixedAliasSpellings,
+    #[error("[aliases] tool is not supported yet; alias namespaces under aliases.mcp or aliases.host")]
+    UnsupportedToolAliases,
     #[error("included config {path} has unsupported top-level field {field:?}")]
     IncludedTopLevel { path: String, field: String },
     #[error("included config {path} cannot set policy field {field:?}")]
@@ -792,6 +848,8 @@ pub enum ConfigError {
         var: String,
         prefix: &'static str,
     },
+    #[error("the {section} entry {name:?} lists token_env, and only a command takes a non-empty list")]
+    TokenEnvList { section: &'static str, name: String },
     #[error("the {section} endpoint {name:?} names {var}, which is not set")]
     MissingSecret {
         section: &'static str,
@@ -952,8 +1010,8 @@ struct RawConfig {
     /// Offline packaging inputs, not part of the policy identity.
     #[serde(default)]
     bundle: RawBundle,
-    #[serde(default)]
-    server_aliases: ServerBindings,
+    aliases: Option<aliases::RawAliases>,
+    server_aliases: Option<aliases::NamespaceBindings>,
     /// Hosted documents only: the host's credential declaration, carried and never
     /// resolved. See [`Config::credentials`].
     #[serde(default)]
@@ -1085,11 +1143,19 @@ struct RawJev {
     max_concurrent: Option<u32>,
 }
 
+/// A binding's `token_env`: one variable, or, beside a `command`, several.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawTokenEnv {
+    One(String),
+    Many(Vec<String>),
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawBinding {
     url: Option<String>,
-    token_env: Option<String>,
+    token_env: Option<RawTokenEnv>,
     builtin: Option<String>,
     command: Option<Vec<String>>,
 }
@@ -1098,7 +1164,7 @@ struct RawBinding {
 #[serde(deny_unknown_fields)]
 struct RawAudienceBinding {
     url: Option<String>,
-    token_env: Option<String>,
+    token_env: Option<RawTokenEnv>,
     command: Option<Vec<String>>,
     readers: Option<BTreeMap<String, String>>,
     lookup: Option<String>,
@@ -1118,7 +1184,21 @@ impl Config {
     /// Load `path`, resolving `batteries/<name>/appa.toml` includes against
     /// `battery_dirs` in the given order before the root config directory.
     pub fn load_from(path: &Path, battery_dirs: &[PathBuf]) -> Result<Config, ConfigError> {
-        Self::load_with_keys(path, battery_dirs, KeySource::Lookup(&|var| std::env::var(var).ok()))
+        Self::load_for_target(path, battery_dirs, battery_target()?)
+    }
+
+    /// [`Config::load_from`] composing each battery for `target`.
+    pub fn load_for_target(
+        path: &Path,
+        battery_dirs: &[PathBuf],
+        target: BatteryTarget,
+    ) -> Result<Config, ConfigError> {
+        Self::load_with_keys(
+            path,
+            battery_dirs,
+            target,
+            KeySource::Lookup(&|var| std::env::var(var).ok()),
+        )
     }
 
     /// Standalone configuration only: embedding hosts keep their existing environment interface.
@@ -1128,12 +1208,17 @@ impl Config {
         let store = crate::credentials::CredentialStore::for_config(path).map_err(unavailable)?;
         let saved = store.values().map_err(unavailable)?;
         let lookup = |var: &str| std::env::var(var).ok().or_else(|| saved.get(var).cloned());
-        let mut config = Self::load_with_keys(path, battery_dirs, KeySource::Lookup(&lookup))?;
+        let mut config = Self::load_with_keys(path, battery_dirs, battery_target()?, KeySource::Lookup(&lookup))?;
         config.credential_store = Some(store);
         Ok(config)
     }
 
-    fn load_with_keys(path: &Path, battery_dirs: &[PathBuf], keys: KeySource<'_>) -> Result<Config, ConfigError> {
+    fn load_with_keys(
+        path: &Path,
+        battery_dirs: &[PathBuf],
+        target: BatteryTarget,
+        keys: KeySource<'_>,
+    ) -> Result<Config, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Unreadable {
             path: path.display().to_string(),
             source,
@@ -1187,29 +1272,33 @@ impl Config {
                 path: include_path.display().to_string(),
                 source,
             })?;
-            if !seen.insert(include_path.clone()) {
-                return Err(ConfigError::DuplicateInclude { path: authored.clone() });
-            }
             if let Some(name) = crate::batteries::name_from_include(include) {
                 included_batteries.insert(name);
             }
-            let included_text = std::fs::read_to_string(&include_path).map_err(|source| ConfigError::Unreadable {
-                path: include_path.display().to_string(),
-                source,
-            })?;
-            let included: toml::Value = toml::from_str(&included_text).map_err(|source| ConfigError::Unparsable {
-                path: include_path.display().to_string(),
-                source,
-            })?;
-            compose_include(
-                &mut document,
-                included,
-                &include_path,
-                root_version,
-                &root_annotators,
-                &mut replaced_annotators,
-                &mut origins,
-            )?;
+            for policy_path in target_policies(include_path, target)? {
+                if !seen.insert(policy_path.clone()) {
+                    return Err(ConfigError::DuplicateInclude { path: authored.clone() });
+                }
+                let included_text =
+                    std::fs::read_to_string(&policy_path).map_err(|source| ConfigError::Unreadable {
+                        path: policy_path.display().to_string(),
+                        source,
+                    })?;
+                let included: toml::Value =
+                    toml::from_str(&included_text).map_err(|source| ConfigError::Unparsable {
+                        path: policy_path.display().to_string(),
+                        source,
+                    })?;
+                compose_include(
+                    &mut document,
+                    included,
+                    &policy_path,
+                    root_version,
+                    &root_annotators,
+                    &mut replaced_annotators,
+                    &mut origins,
+                )?;
+            }
         }
 
         // The knob is this machine's, not the policy's. It is read from the root file's own
@@ -1254,11 +1343,11 @@ impl Config {
 
     /// The configuration of a host that holds its document in memory rather than reading
     /// `appa.toml`: a `[policy]` table, an optional `[externals]` table and the optional
-    /// `[server_aliases]` and `[credentials]` tables, plus the two settings the host fills
+    /// `[aliases]` and `[credentials]` tables, plus the two settings the host fills
     /// in where the document states neither. The document comes from an author who may run
     /// nothing on this machine and read none of its files, so every other top-level key and
-    /// every `command` binding is refused. `server_aliases` stays admitted because it is the
-    /// host's own declaration of which connections a namespace names, and a document that
+    /// every `command` binding is refused. `aliases` stays admitted because it is the
+    /// host's own declaration of which identities a namespace names, and a document that
     /// carries it is one snapshot: reopened or replayed under the same bytes, a trajectory
     /// resolves its rules the way it did when it opened. `[credentials]` is admitted on the
     /// same terms and carried, never resolved: it names, for each child-credential variable
@@ -1367,20 +1456,22 @@ impl Config {
                     path: battery.name.to_string(),
                 });
             }
-            let included: toml::Value = toml::from_str(battery.policy).map_err(|source| ConfigError::Unparsable {
-                path: battery.name.to_string(),
-                source,
-            })?;
-            refuse_ungranted_credentials(battery, &included)?;
-            compose_include(
-                &mut document,
-                included,
-                Path::new(battery.name),
-                root_version,
-                &root_annotators,
-                &mut replaced_annotators,
-                &mut origins,
-            )?;
+            for policy in battery.target.into_iter().chain([battery.base]) {
+                let included: toml::Value = toml::from_str(policy).map_err(|source| ConfigError::Unparsable {
+                    path: battery.name.to_string(),
+                    source,
+                })?;
+                refuse_ungranted_credentials(battery, &included)?;
+                compose_include(
+                    &mut document,
+                    included,
+                    Path::new(battery.name),
+                    root_version,
+                    &root_annotators,
+                    &mut replaced_annotators,
+                    &mut origins,
+                )?;
+            }
         }
         let document_table = document.as_table_mut().expect("a TOML document parses as a table");
         let timeout_ms = i64::try_from(defaults.consult_timeout.as_millis()).map_err(|_| {
@@ -1569,7 +1660,7 @@ impl Config {
             credential_store: None,
             keys: keys.keys(),
             policy: PolicyFile::new(text.into_bytes(), raw.policy),
-            server_aliases: raw.server_aliases,
+            aliases: aliases::admit(raw.aliases, raw.server_aliases)?,
             credentials: raw.credentials,
             inventory: raw.appa_inventory,
             reporting,
@@ -1606,7 +1697,7 @@ fn hosted_root(text: &str, include: IncludeAdmission) -> Result<toml::Value, Con
     let document: toml::Value = toml::from_str(text).map_err(|source| ConfigError::UnparsablePolicy { source })?;
     let table = document.as_table().expect("a TOML document parses as a table");
     if let Some(key) = table.keys().find(|key| match key.as_str() {
-        "policy" | "externals" | "server_aliases" | "credentials" => false,
+        "policy" | "externals" | "aliases" | "server_aliases" | "credentials" => false,
         "include" => include == IncludeAdmission::Refused,
         _ => true,
     }) {
@@ -1801,6 +1892,46 @@ fn declared_annotators(policy: &toml::Value) -> std::collections::BTreeSet<Strin
         .collect()
 }
 
+/// The policies an include composes for `target`, as canonical paths. An include of
+/// a battery's base composes its target policy first when the battery declares
+/// targets, and any other file of such a battery is refused: the deployment target
+/// picks its target policy. Any other include composes alone.
+fn target_policies(include_path: PathBuf, target: BatteryTarget) -> Result<Vec<PathBuf>, ConfigError> {
+    let dir = include_path.parent().expect("a canonical file path has a parent");
+    let manifest = dir.join(appa_package::MANIFEST_FILE);
+    if !manifest.is_file() {
+        return Ok(vec![include_path]);
+    }
+    let package = appa_package::Package::read(&manifest).map_err(|source| ConfigError::UnreadableBatteryManifest {
+        path: manifest.display().to_string(),
+        source: Box::new(source),
+    })?;
+    let appa_package::Role::Battery(battery) = &package.role else {
+        return Ok(vec![include_path]);
+    };
+    let is_base = std::fs::canonicalize(dir.join(battery.base.as_str())).is_ok_and(|base| base == include_path);
+    match (is_base, &battery.targets) {
+        (true, _) => (),
+        (false, Some(_)) => {
+            return Err(ConfigError::TargetPolicyIncluded {
+                path: include_path.display().to_string(),
+            });
+        }
+        (false, None) => return Ok(vec![include_path]),
+    }
+    battery
+        .compose_order(target)
+        .into_iter()
+        .map(|policy| {
+            let policy_path = dir.join(policy.as_str());
+            std::fs::canonicalize(&policy_path).map_err(|source| ConfigError::Unreadable {
+                path: policy_path.display().to_string(),
+                source,
+            })
+        })
+        .collect()
+}
+
 /// Every `token_env` a battery's externals name is one the host granted it. Shapes
 /// other than a table of tables are left to composition, which refuses them.
 fn refuse_ungranted_credentials(battery: &HostedBattery<'_>, included: &toml::Value) -> Result<(), ConfigError> {
@@ -1820,9 +1951,12 @@ fn refuse_ungranted_credentials(battery: &HostedBattery<'_>, included: &toml::Va
         let bindings = entries
             .iter()
             .filter_map(|(name, entry)| Some((name, entry.get("token_env")?)));
-        for (name, var) in profile.into_iter().chain(bindings) {
-            if let Some(var) = var.as_str()
-                && !battery.token_env.contains(&var)
+        for (name, named) in profile.into_iter().chain(bindings) {
+            let vars = named.as_array().map_or(std::slice::from_ref(named), Vec::as_slice);
+            if let Some(var) = vars
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .find(|var| !battery.token_env.contains(var))
             {
                 return Err(ConfigError::UngrantedBatteryCredential {
                     battery: battery.name.to_string(),
@@ -2262,15 +2396,15 @@ fn resolve_readers(name: &str, readers: BTreeMap<String, String>) -> Result<BTre
 }
 
 /// A command's `token_env` is the opposite of a URL's: the runtime sends nothing, it
-/// forwards one variable to the child that reads it, and only from the passthrough
-/// namespace. Presence is deliberately not checked here — the runtime never reads the
+/// forwards each variable named, one or a list, to the child that reads it, and only from
+/// the passthrough namespace. Presence is deliberately not checked here — the runtime never reads the
 /// value, so a policy stays loadable and describable on a machine that holds no provider
 /// credential, and a missing one surfaces as the child's own refusal to answer.
 fn resolve_command(
     section: Section,
     name: &str,
     argv: Vec<String>,
-    token_env: Option<String>,
+    token_env: Option<RawTokenEnv>,
     origins: &BTreeMap<String, PathBuf>,
 ) -> Result<ResolverCommand, ConfigError> {
     if argv.is_empty() || argv.iter().any(String::is_empty) {
@@ -2279,9 +2413,20 @@ fn resolve_command(
             name: name.to_string(),
         });
     }
+    let token_env = match token_env {
+        None => Vec::new(),
+        Some(RawTokenEnv::One(var)) => vec![var],
+        Some(RawTokenEnv::Many(vars)) if !vars.is_empty() => vars,
+        Some(RawTokenEnv::Many(_)) => {
+            return Err(ConfigError::TokenEnvList {
+                section: section.name(),
+                name: name.to_string(),
+            });
+        }
+    };
     if let Some(var) = token_env
-        .as_ref()
-        .filter(|var| !var.starts_with(PROVIDER_CREDENTIAL_PREFIX))
+        .iter()
+        .find(|var| !var.starts_with(PROVIDER_CREDENTIAL_PREFIX))
     {
         return Err(ConfigError::CommandCredentialVariable {
             section: section.name(),
@@ -2413,11 +2558,19 @@ fn validated_url(section: &'static str, name: &str, url: String) -> Result<Strin
 fn resolve_token(
     section: &'static str,
     name: &str,
-    token_env: Option<String>,
+    token_env: Option<RawTokenEnv>,
     keys: KeySource<'_>,
 ) -> Result<Option<EndpointToken>, ConfigError> {
-    let Some(var) = token_env else {
-        return Ok(None);
+    // The runtime sends one bearer token, so a URL names one variable.
+    let var = match token_env {
+        None => return Ok(None),
+        Some(RawTokenEnv::One(var)) => var,
+        Some(RawTokenEnv::Many(_)) => {
+            return Err(ConfigError::TokenEnvList {
+                section,
+                name: name.to_string(),
+            });
+        }
     };
     let var = endpoint_token_variable(section, name, var)?;
     let KeySource::Lookup(lookup) = keys else {
@@ -2762,11 +2915,54 @@ mod tests {
         else {
             panic!("the slack audience source is a command")
         };
-        assert_eq!(command.token_env.as_deref(), Some("APPA_PROVIDER_SLACK_TOKEN"));
+        assert_eq!(command.token_env, ["APPA_PROVIDER_SLACK_TOKEN"]);
         assert!(
             !format!("{command:?}").contains("xoxb-fixture"),
             "the binding carries the variable name, never the credential"
         );
+    }
+
+    /// A command may list the several credentials its helper reads, each from the
+    /// passthrough namespace; a URL sends one bearer token, so it names one variable.
+    #[test]
+    fn a_command_may_list_credentials_and_a_url_names_one() {
+        let command = |token_env: &str| {
+            format!(
+                "{MINIMAL}\n[externals.audience.slack]\ncommand = [\"python3\", \"source.py\"]\ntoken_env = {token_env}\n"
+            )
+        };
+        let config = parse(&command(
+            "[\"APPA_PROVIDER_SLACK_HOST\", \"APPA_PROVIDER_SLACK_SECRET\"]",
+        ))
+        .expect("a list of passthrough variables validates");
+        let Some(AudienceImplementation::Transport(Transport::Command(bound))) = config
+            .externals
+            .audience
+            .get("slack")
+            .map(|binding| &binding.implementation)
+        else {
+            panic!("the slack audience source is a command")
+        };
+        assert_eq!(
+            bound.token_env,
+            ["APPA_PROVIDER_SLACK_HOST", "APPA_PROVIDER_SLACK_SECRET"]
+        );
+
+        assert!(matches!(
+            parse(&command("[\"APPA_PROVIDER_SLACK_HOST\", \"APPA_SLACK_SECRET\"]")),
+            Err(ConfigError::CommandCredentialVariable { var, .. }) if var == "APPA_SLACK_SECRET"
+        ));
+        assert!(matches!(parse(&command("[]")), Err(ConfigError::TokenEnvList { .. })));
+        let set = |_: &str| Some("fixture".to_string());
+        assert!(matches!(
+            parse_with(
+                &format!(
+                    "{MINIMAL}\n[externals.authorities.security]\nurl = \"https://authority.internal\"\ntoken_env = [\"APPA_AUTHORITY_TOKEN\"]\n"
+                ),
+                set
+            ),
+            Err(ConfigError::TokenEnvList { .. })
+        ));
     }
 
     #[test]
@@ -3402,12 +3598,14 @@ mod tests {
         match entry {
             "batteries/notes@sha256-1111/appa.toml" => Ok(HostedBattery {
                 name: "notes",
-                policy: NOTES_BATTERY,
+                base: NOTES_BATTERY,
+                target: None,
                 token_env: &[],
             }),
             "batteries/desk@sha256-2222/appa.toml" => Ok(HostedBattery {
                 name: "desk",
-                policy: DESK_BATTERY,
+                base: DESK_BATTERY,
+                target: None,
                 token_env: &[],
             }),
             _ => Err(IncludeResolution::Unknown),
@@ -3446,17 +3644,29 @@ mod tests {
     /// The host's own binding of policy namespaces to connections rides inside the
     /// document, so the bytes a trajectory opens under resolve the same way on reload.
     #[test]
-    fn a_hosted_document_may_bind_server_aliases() {
-        let config = hosted("[server_aliases]\ngithub = [\"github_prod\", \"github_dev\"]\n[policy]\nversion = 2\n")
-            .expect("server aliases are the host's to declare");
-        assert_eq!(
-            config.server_aliases,
-            BTreeMap::from([(
+    fn a_hosted_document_may_bind_aliases() {
+        let config = hosted(
+            "[aliases]\nmcp = { github = [\"github_prod\", \"github_dev\"] }\nhost = { claude-code = [\"archestra\"] }\n[policy]\nversion = 2\n",
+        )
+        .expect("aliases are the host's to declare");
+        let expected = Aliases {
+            mcp: BTreeMap::from([(
                 "github".to_string(),
-                vec!["github_prod".to_string(), "github_dev".to_string()]
-            )])
-        );
-        assert!(String::from_utf8_lossy(config.policy_file().bytes()).contains("server_aliases"));
+                vec!["github_prod".to_string(), "github_dev".to_string()],
+            )]),
+            host: BTreeMap::from([("claude-code".to_string(), vec!["archestra".to_string()])]),
+        };
+        assert_eq!(config.aliases, expected);
+        let stored: toml::Value = toml::from_str(std::str::from_utf8(config.policy_file().bytes()).unwrap()).unwrap();
+        assert_eq!(aliases::of_document(&stored).unwrap(), expected);
+
+        let legacy = hosted("[server_aliases]\ngithub = [\"github_prod\"]\n[policy]\nversion = 2\n")
+            .expect("a top-level server_aliases table still binds mcp namespaces");
+        assert_eq!(legacy.aliases.mcp["github"], vec!["github_prod"]);
+        assert!(matches!(
+            hosted("[server_aliases]\n[aliases]\n[policy]\nversion = 2\n"),
+            Err(ConfigError::MixedAliasSpellings)
+        ));
     }
 
     #[test]
@@ -3465,7 +3675,8 @@ mod tests {
             HOSTED_ROOT,
             &[HostedBattery {
                 name: "github",
-                policy: GITHUB_BATTERY,
+                base: GITHUB_BATTERY,
+                target: None,
                 token_env: &["APPA_HOSTED_TEST_BRIDGE_TOKEN"],
             }],
         )
@@ -3482,7 +3693,8 @@ mod tests {
                 HOSTED_ROOT,
                 &[HostedBattery {
                     name: "github",
-                    policy: GITHUB_BATTERY,
+                    base: GITHUB_BATTERY,
+                    target: None,
                     token_env: &["APPA_HOSTED_TEST_BRIDGE_TOKEN"],
                 }],
             )
@@ -3602,7 +3814,8 @@ mod tests {
                 &root("include = [\"batteries/notes@sha256-1111/appa.toml\", \"batteries/notes@sha256-3333/appa.toml\"]"),
                 |_| Ok(HostedBattery {
                     name: "notes",
-                    policy: NOTES_BATTERY,
+                    base: NOTES_BATTERY,
+                    target: None,
                     token_env: &[],
                 })
             ),
@@ -3628,7 +3841,8 @@ mod tests {
             TEXT,
             &[HostedBattery {
                 name: "notes",
-                policy: NOTES_BATTERY,
+                base: NOTES_BATTERY,
+                target: None,
                 token_env: &[],
             }],
         )
@@ -3682,7 +3896,8 @@ mod tests {
                 HOSTED_ROOT,
                 &[HostedBattery {
                     name: "rogue",
-                    policy: "[credentials]\nAPPA_PROVIDER_GITHUB_TOKEN = \"github_prod\"\n[policy]\nversion = 2\n",
+                    base: "[credentials]\nAPPA_PROVIDER_GITHUB_TOKEN = \"github_prod\"\n[policy]\nversion = 2\n",
+                    target: None,
                     token_env: &[],
                 }],
             ),
@@ -3730,7 +3945,8 @@ mod tests {
                 root,
                 &[HostedBattery {
                     name: "github",
-                    policy: GITHUB_BATTERY,
+                    base: GITHUB_BATTERY,
+                    target: None,
                     token_env: &["APPA_HOSTED_TEST_BRIDGE_TOKEN"],
                 }],
             );
@@ -3747,7 +3963,8 @@ mod tests {
             HOSTED_ROOT,
             &[HostedBattery {
                 name: "github",
-                policy: GITHUB_BATTERY,
+                base: GITHUB_BATTERY,
+                target: None,
                 token_env: &[],
             }],
         );
@@ -3761,6 +3978,62 @@ mod tests {
         );
     }
 
+    /// A command that lists several credentials needs the host's grant for each.
+    #[test]
+    fn a_battery_command_reads_every_listed_variable_only_when_each_is_granted() {
+        let base = GITHUB_BATTERY
+            .replace(
+                "url = \"http://127.0.0.1:9000/api/openappa/helpers/install-1/github.visibility\"",
+                "command = [\"python3\", \"visibility.py\"]",
+            )
+            .replace(
+                "token_env = \"APPA_HOSTED_TEST_BRIDGE_TOKEN\"",
+                "token_env = [\"APPA_PROVIDER_GITHUB_HOST\", \"APPA_PROVIDER_GITHUB_SECRET\"]",
+            );
+        let granted = |token_env| {
+            hosted_composed(
+                HOSTED_ROOT,
+                &[HostedBattery {
+                    name: "github",
+                    base: &base,
+                    target: None,
+                    token_env,
+                }],
+            )
+        };
+        assert!(matches!(
+            granted(&["APPA_PROVIDER_GITHUB_HOST"]),
+            Err(ConfigError::UngrantedBatteryCredential { var, .. }) if var == "APPA_PROVIDER_GITHUB_SECRET"
+        ));
+        // Granted in full, the battery passes the grant and meets the hosted refusal of commands.
+        assert!(matches!(
+            granted(&["APPA_PROVIDER_GITHUB_HOST", "APPA_PROVIDER_GITHUB_SECRET"]),
+            Err(ConfigError::HostedCommand { .. })
+        ));
+    }
+
+    /// The host's grant covers a battery's target policy as it covers its base.
+    #[test]
+    fn a_target_policy_reads_only_the_variables_its_host_granted() {
+        let targeted = |token_env| HostedBattery {
+            name: "github",
+            base: NOTES_BATTERY,
+            target: Some(GITHUB_BATTERY),
+            token_env,
+        };
+        assert!(matches!(
+            hosted_composed(HOSTED_ROOT, &[targeted(&[])]),
+            Err(ConfigError::UngrantedBatteryCredential { battery, var, .. })
+                if battery == "github" && var == "APPA_HOSTED_TEST_BRIDGE_TOKEN"
+        ));
+        let config = hosted_composed(HOSTED_ROOT, &[targeted(&["APPA_HOSTED_TEST_BRIDGE_TOKEN"])])
+            .expect("one grant covers both policies");
+        assert_eq!(
+            tool_names(&config),
+            ["root__read", "mcp/github/get_file_contents", "mcp/notes/read"]
+        );
+    }
+
     /// Without its keys, a hosted document keeps every refusal that needs no secret: a
     /// battery still reads only the variables its host granted, and a granted token defers.
     #[test]
@@ -3770,7 +4043,8 @@ mod tests {
             move |entry: &str| match entry {
                 "batteries/github@sha256-3333/appa.toml" => Ok(HostedBattery {
                     name: "github",
-                    policy: GITHUB_BATTERY,
+                    base: GITHUB_BATTERY,
+                    target: None,
                     token_env,
                 }),
                 _ => Err(IncludeResolution::Unknown),
@@ -3796,7 +4070,8 @@ mod tests {
             root,
             &[HostedBattery {
                 name: "github",
-                policy: GITHUB_BATTERY,
+                base: GITHUB_BATTERY,
+                target: None,
                 token_env: &["APPA_HOSTED_TEST_BRIDGE_TOKEN"],
             }],
         )
@@ -3812,9 +4087,10 @@ mod tests {
 
     #[test]
     fn hosted_batteries_are_refused_where_a_file_include_would_be() {
-        let battery = |policy: &'static str| HostedBattery {
+        let battery = |base: &'static str| HostedBattery {
             name: "github",
-            policy,
+            base,
+            target: None,
             token_env: &["APPA_HOSTED_TEST_BRIDGE_TOKEN"],
         };
         assert!(matches!(
@@ -3828,6 +4104,10 @@ mod tests {
         assert!(matches!(
             hosted_composed(HOSTED_ROOT, &[battery("[policy]\nversion = 2\n[server_aliases]\nx = [\"y\"]\n")]),
             Err(ConfigError::IncludedTopLevel { field, .. }) if field == "server_aliases"
+        ));
+        assert!(matches!(
+            hosted_composed(HOSTED_ROOT, &[battery("[policy]\nversion = 2\n[aliases]\nhost = { x = [\"y\"] }\n")]),
+            Err(ConfigError::IncludedTopLevel { field, .. }) if field == "aliases"
         ));
         assert!(matches!(
             hosted_composed(
@@ -4044,7 +4324,8 @@ mod tests {
                 text,
                 &[HostedBattery {
                     name: "notes",
-                    policy: NOTES_BATTERY,
+                    base: NOTES_BATTERY,
+                    target: None,
                     token_env: &[],
                 }],
             ),
@@ -4569,7 +4850,8 @@ mod tests {
     fn the_root_tunes_the_limits_of_a_battery_jev_profile() {
         let battery = HostedBattery {
             name: "jev",
-            policy: "[policy]\nversion = 2\n[externals.jev]\ntoken_env = \"APPA_PROVIDER_JEV_API_KEY\"\n",
+            base: "[policy]\nversion = 2\n[externals.jev]\ntoken_env = \"APPA_PROVIDER_JEV_API_KEY\"\n",
+            target: None,
             token_env: &[JEV_KEY],
         };
         let limits = format!("{HOSTED_ROOT}[externals.jev]\ntimeout_ms = 3000\nmax_concurrent = 4\n");
@@ -4594,7 +4876,8 @@ mod tests {
     fn a_hosted_battery_reads_the_jev_key_only_when_granted() {
         let battery = |token_env: &'static [&'static str]| HostedBattery {
             name: "jev",
-            policy: "[policy]\nversion = 2\n[externals.jev]\ntoken_env = \"APPA_PROVIDER_JEV_API_KEY\"\n",
+            base: "[policy]\nversion = 2\n[externals.jev]\ntoken_env = \"APPA_PROVIDER_JEV_API_KEY\"\n",
+            target: None,
             token_env,
         };
         assert!(matches!(

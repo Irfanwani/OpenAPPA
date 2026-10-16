@@ -9,6 +9,7 @@ members = [
     "appa-eventlog",
     "appa-policy",
     "appa-adapter-amp",
+    "appa-adapter-opencode",
     "appa-adapter-claude-code",
     "appa-adapter-kagent",
     "appa-runtime-api",
@@ -23,7 +24,7 @@ exclude = ["bench/corp-systems"]
 [workspace.package]
 edition = "2024"
 publish = false
-version = "0.32.0"
+version = "0.34.0"
 
 [workspace.lints.rust]
 dead_code = "deny"

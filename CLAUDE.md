@@ -47,7 +47,7 @@ surfaces may break without shims or deprecation paths.
   the **checked monoid of labels** (`audience × trust`) and the **free monoid of events**.
   Always prefer Information Flow Control (IFC) monoids (`trust` lattice and `self ⊆ internal ⊆ public` audience chain) to express security invariants.
 - **Effects are a hacky workaround**: History/effect tracking (`emits`, `requires = { history = [...] }`) is an imperative state-machine escape hatch, not the primary algebra. Never reach for effects when information flow / label bounding can express the invariant.
-- **Autonomous execution over attention**: Do not use `attention` marks where trust or audience bounding can express the boundary, and avoid default `hitl` requirements that stall autonomous agents. The reserved `blocked` mark, which no authority can permit, is the one way to deny an action outright; use it only for that. Data that is `trusted` and within the target `audience` boundary should flow without human interruption. Attention marks are reserved strictly for real human-in-the-loop decisions (opt-in overlays), or `blocked` where a sanitizer that would make the flow safe does not exist yet.
+- **Autonomous execution over attention**: Do not use `attention` marks where trust or audience bounding can express the boundary, and avoid default `human-approval` requirements that stall autonomous agents. The reserved `blocked` mark, which no authority can permit, is the one way to deny an action outright; use it only for that. Data that is `trusted` and within the target `audience` boundary should flow without human interruption. Attention marks are reserved strictly for real human-in-the-loop decisions (opt-in overlays), or `blocked` where a sanitizer that would make the flow safe does not exist yet.
 
 ## Collaboration
 
@@ -93,8 +93,9 @@ better as a result.
 **Vocabulary**
 
 - Use APPA's defined terms consistently. Terms that readers must type in TOML
-  or use through an API, including `delta`, `requires`, `emits`, `attention`,
-  `contains`, `within`, and `permits`, must be taught rather than paraphrased away.
+  or use through an API, including `delta`, `forwards`, `requires`, `emits`,
+  `attention`, `contains`, `within`, and `permits`, must be taught rather than
+  paraphrased away.
 - Prefer plain technical English and the shortest accurate term. Reference documentation MUST follow ASD-STE100 (Simplified Technical English): short sentences (maximum 20–25 words), active voice, precise technical vocabulary, zero conversational fluff or oversimplification, and strict preservation of technical and modal nuances (such as capability `can` vs action `does`, `MUST`, `MAY`, `MUST NOT`). Gloss specialized IFC or security vocabulary at first use; omit it when it adds no precision.
 - Reader-facing prose may explain a wire term in ordinary language. Show the
   exact wire term where readers need to recognize or type it.

@@ -260,6 +260,15 @@ enum Occasion<'a> {
     Other,
 }
 
+impl<'a> Occasion<'a> {
+    fn call_id(self) -> Option<&'a str> {
+        match self {
+            Occasion::Proposal { call_id, .. } | Occasion::Report { call_id } => call_id,
+            Occasion::Remedy { .. } | Occasion::Other => None,
+        }
+    }
+}
+
 fn fresh_entropy() -> OfferNonce {
     OfferNonce(rand::random::<[u8; 32]>())
 }
@@ -926,7 +935,7 @@ impl Session {
     pub fn on_spawn_resume(&self, call: ProposedCall, child: TrajectoryId) -> Result<(), EventError> {
         let opened = self.inner.log(&self.root)?;
         let policy = self.policy(&opened)?;
-        let decision = self.drive(&policy, Some(opened), true, Opening::default(), |context| {
+        let decision = self.drive(&policy, true, Opening::default(), |context| {
             let dispatch = context.classify_report(&call, None)?;
             let fork = appa_engine::value::ForkId::of(&dispatch);
             match context.fork_status(&fork) {
@@ -1196,7 +1205,7 @@ impl Session {
         let opened = self.inner.log(&self.root)?;
         let policy = self.policy(&opened)?;
         let mut contract = None;
-        let decision = self.drive(&policy, Some(opened), true, Opening::default(), |context| {
+        let decision = self.drive(&policy, true, Opening::default(), |context| {
             let fork = fork(context)?;
             match context.fork_status(&fork) {
                 ForkStatus::Unprepared | ForkStatus::Failed | ForkStatus::ParentEnded => Err(EventError::SpawnNotTaken),
@@ -1356,7 +1365,6 @@ impl Session {
         let opened = self.inner.log(&self.root)?;
         let policy = self.policy(&opened)?;
         tracing::Span::current().record("appa.policy.id", crate::engine::policy_file_key(opened.policy_file()));
-        let mut opened = Some(opened);
         // External answers carry the exact call or group they answered for, and the
         // engine matches them only while that is still the one in front of it — a
         // rewritten call is annotated afresh by construction, so this loop carries
@@ -1367,9 +1375,7 @@ impl Session {
         for _ in 0..RESOLUTION_ROUNDS {
             let carried = evidence.clone();
             let entering = carried.is_empty();
-            let decision = self.drive(&policy, opened.take(), entering, opening, |context| {
-                event(context, carried.clone())
-            })?;
+            let decision = self.drive(&policy, entering, opening, |context| event(context, carried.clone()))?;
             match decision.then {
                 // The engine batches every missing answer into one request set, and evidence
                 // is matched by name, never by position. Without a reviewer the
@@ -1413,16 +1419,15 @@ impl Session {
     fn drive(
         &self,
         policy: &crate::engine::PolicyEngine<'_>,
-        mut opened: Option<appa_eventlog::Log>,
         entering: bool,
         opening: Opening<'_>,
         mut event: impl FnMut(&Decided<'_>) -> Result<EngineEvent, EventError>,
     ) -> Result<EngineDecision, EventError> {
         for attempt in 1..=REPLAY_LIMIT {
-            let log = match opened.take() {
-                Some(log) => log,
-                None => self.inner.log(&self.root)?,
-            };
+            // The read, the decision and the append are one step: the family's other writers
+            // wait for it rather than lose their compare-and-swap to it.
+            let step = self.inner.step(&self.root)?;
+            let log = self.inner.step_log(&step, &self.root)?;
             let view = policy.engine().rebuild_view(&log).map_err(EventError::from)?;
             let context = Decided {
                 session: self,
@@ -1536,7 +1541,7 @@ impl Session {
                 .ok()
                 .filter(|hold| hold.root == self.root.as_str());
             let appended = if let Some(hold) = hold {
-                self.inner.store.append_holding_embedded_read(
+                step.append_holding_embedded_read(
                     &log,
                     facts,
                     host_record.as_ref(),
@@ -1549,8 +1554,8 @@ impl Session {
                 )
             } else {
                 match host_record.as_ref() {
-                    Some(record) => self.inner.store.append_host(&log, facts, record),
-                    None => self.inner.store.append(&log, facts),
+                    Some(record) => step.append_host(&log, facts, record),
+                    None => step.append(&log, facts),
                 }
             };
             match appended {
@@ -1601,11 +1606,24 @@ impl Session {
         let started_at = std::time::SystemTime::now();
         let started = std::time::Instant::now();
         let externals = &self.deployment.externals;
-        let (outcome, transcript) = match &self.inner.recorder {
-            // Boxed: the transport future is large, and every drive awaits it deep in the stack.
-            Some(_) => Box::pin(externals.consult_transcribed(consult, elicitation, ruling)).await,
-            None => (Box::pin(externals.consult(consult, elicitation, ruling)).await, None),
+        let consulting = async {
+            match &self.inner.recorder {
+                // Boxed: the transport future is large, and every drive awaits it deep in the stack.
+                Some(_) => Box::pin(externals.consult_transcribed(consult, elicitation, ruling)).await,
+                None => (Box::pin(externals.consult(consult, elicitation, ruling)).await, None),
+            }
         };
+        #[cfg(feature = "archestra")]
+        let (outcome, transcript) = {
+            let attribution = crate::model::archestra::Attribution {
+                root: self.root.clone(),
+                trajectory: self.trajectory.clone(),
+                call_id: occasion.call_id().map(str::to_owned),
+            };
+            crate::model::archestra::within(self.inner.archestra_context.as_deref(), attribution, consulting).await
+        };
+        #[cfg(not(feature = "archestra"))]
+        let (outcome, transcript) = consulting.await;
         // A transport that read on for the record alone says when the outcome was known.
         let settled = transcript
             .as_ref()
@@ -1631,12 +1649,7 @@ impl Session {
                 let context = ConsultContext {
                     root: self.root.0.clone(),
                     trajectory: self.trajectory.0.clone(),
-                    call_id: match occasion {
-                        Occasion::Proposal { call_id, .. } | Occasion::Report { call_id } => {
-                            call_id.map(str::to_string)
-                        }
-                        Occasion::Remedy { .. } | Occasion::Other => None,
-                    },
+                    call_id: occasion.call_id().map(str::to_string),
                     offer_id: match occasion {
                         Occasion::Remedy { offer } => Some(offer.0.clone()),
                         Occasion::Proposal { .. } | Occasion::Report { .. } | Occasion::Other => None,
@@ -2201,15 +2214,21 @@ context_control = true
         sanitizer: Option<&str>,
         label: crate::engine::LabelSpelling,
     ) -> ExactCall {
-        authorize_spawn_as(session, spawn, SpawnKind::Single, sanitizer, label).await
+        let route = match sanitizer {
+            None => appa_runtime_api::OfferedReturn::AsSpoken,
+            Some(sanitizer) => appa_runtime_api::OfferedReturn::Sanitized {
+                sanitizer: sanitizer.to_string(),
+            },
+        };
+        authorize_spawn_as(session, spawn, SpawnKind::Single, route, Some(label)).await
     }
 
     async fn authorize_spawn_as(
         session: &Session,
         spawn: ProposedCall,
         kind: SpawnKind,
-        sanitizer: Option<&str>,
-        label: crate::engine::LabelSpelling,
+        route: appa_runtime_api::OfferedReturn,
+        label: Option<crate::engine::LabelSpelling>,
     ) -> ExactCall {
         let ToolCallDecision::Deny { offers, .. } = session
             .on_tool_call_identified(spawn, None, Some(kind), None)
@@ -2220,12 +2239,7 @@ context_control = true
         };
         let quoted = offers
             .iter()
-            .find(|offer| {
-                offer.returns.as_ref().map(|route| match route {
-                    appa_runtime_api::OfferedReturn::AsSpoken => None,
-                    appa_runtime_api::OfferedReturn::Sanitized { sanitizer } => Some(sanitizer.as_str()),
-                }) == Some(sanitizer)
-            })
+            .find(|offer| offer.returns.as_ref() == Some(&route))
             .map(|offer| OfferId(offer.id.clone()))
             .expect("the menu offers the requested return route");
         let log = session.inner.log(&session.root).expect("the log reads");
@@ -2234,7 +2248,7 @@ context_control = true
             .on_remedy(
                 offer,
                 RemedyArguments {
-                    label: Some(label),
+                    label,
                     return_schema: None,
                 },
                 None,
@@ -3449,6 +3463,61 @@ context_control = false
         );
     }
 
+    /// The parent declared it takes no return: the child narrows freely, its text stop is
+    /// blocked, and its empty stop leaves the parent's label and sinks as they were.
+    #[tokio::test]
+    async fn a_void_child_narrows_freely_and_leaves_the_parent_unchanged() {
+        let dir = tempfile::tempdir().expect("a temp dir is creatable");
+        let runtime = Runtime::open(config_with(FETCH_AND_SEND, None), dir.path().join("appa.db"), None)
+            .expect("the deployment opens");
+        let session = runtime.create_session(root(), None).expect("a fresh id opens");
+        let spawn = fetch(serde_json::json!({"a": 9}));
+        let call = authorize_spawn_as(
+            &session,
+            spawn.clone(),
+            SpawnKind::Single,
+            appa_runtime_api::OfferedReturn::Void,
+            None,
+        )
+        .await;
+        let ToolCallDecision::Allow {
+            spawn: Some(binding), ..
+        } = session
+            .on_tool_call(call.proposed(), true)
+            .await
+            .expect("the approved spawn releases")
+        else {
+            panic!("the approved spawn releases with its fork");
+        };
+        let mut child = session
+            .on_child_start(TrajectoryId("cc:child".to_string()), SpawnRef::Binding(binding))
+            .expect("the fork binds and the child opens");
+        // Under the bare floor at the parent's label no plan would accept this drop.
+        admit_success(&runtime, &mut child, taint(serde_json::json!({"a": 1}))).await;
+
+        assert!(matches!(
+            child
+                .on_child_end(Some("summary of untrusted data".to_string()))
+                .await
+                .expect("the stop is judged"),
+            crate::api::ChildReturnDecision::Blocked { .. }
+        ));
+        assert_eq!(
+            child.on_child_end(None).await.expect("the empty stop ends the child"),
+            crate::api::ChildReturnDecision::NoValue
+        );
+        session
+            .on_tool_result(
+                spawn,
+                ToolOutcome::Success {
+                    body: OutcomeBody::Unavailable,
+                },
+            )
+            .await
+            .expect("the spawn dispatch closes");
+        assert_eq!(runtime.status(&root()).expect("the root answers").trust, "trusted");
+    }
+
     /// The parent declared it takes a suspicious return; the child's tainted return
     /// crosses as spoken, narrows the parent, and the parent's trusted-floor sink blocks.
     #[tokio::test]
@@ -3515,76 +3584,69 @@ context_control = false
     }
     #[tokio::test]
     async fn symbolic_audience_acceptance_needs_no_membership_sources() {
-        for requirement in ["within", "contains"] {
-            let policy = format!(
-                r#"
+        let policy = r#"
 version = 2
 [[policy.tool]]
 name = "read_internal"
-delta = {{ audience = ["internal"] }}
-requires = {{ audience = {{ {requirement} = ["internal"] }} }}
+delta = { audience = ["internal"] }
+requires = { audience = { contains = ["internal"] } }
 [[policy.tool]]
 name = "send_reader"
-delta = {{}}
-requires = {{ audience = {{ contains = ["reader@example.com"] }} }}
-"#
-            );
-            let dir = tempfile::tempdir().unwrap();
-            let db = dir.path().join("appa.db");
-            let runtime = Runtime::open(config_with(&policy, None), db.clone(), None).unwrap();
-            let session = runtime.create_session(root(), None).unwrap();
-            let read = ProposedCall {
-                tool: "read_internal".into(),
-                arguments: raw(serde_json::json!({})),
-                cwd: None,
-            };
-            assert!(matches!(
-                session.on_tool_call(read.clone(), false).await.unwrap(),
-                ToolCallDecision::Deny { .. }
-            ));
-            let decision = session
-                .on_remedy(surfaced_offer(&runtime), RemedyArguments::default(), None, None)
-                .await
-                .unwrap();
-            assert!(
-                matches!(decision, RemedyDecision::Authorized { .. }),
-                "{requirement}: {decision:?}"
-            );
-            assert!(matches!(
-                session.on_tool_call(read.clone(), false).await.unwrap(),
-                ToolCallDecision::Allow { .. }
-            ));
+delta = {}
+requires = { audience = { contains = ["reader@example.com"] } }
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("appa.db");
+        let runtime = Runtime::open(config_with(policy, None), db.clone(), None).unwrap();
+        let session = runtime.create_session(root(), None).unwrap();
+        let read = ProposedCall {
+            tool: "read_internal".into(),
+            arguments: raw(serde_json::json!({})),
+            cwd: None,
+        };
+        assert!(matches!(
+            session.on_tool_call(read.clone(), false).await.unwrap(),
+            ToolCallDecision::Deny { .. }
+        ));
+        let decision = session
+            .on_remedy(surfaced_offer(&runtime), RemedyArguments::default(), None, None)
+            .await
+            .unwrap();
+        assert!(matches!(decision, RemedyDecision::Authorized { .. }), "{decision:?}");
+        assert!(matches!(
+            session.on_tool_call(read.clone(), false).await.unwrap(),
+            ToolCallDecision::Allow { .. }
+        ));
+        session
+            .on_tool_result(
+                read,
+                ToolOutcome::Success {
+                    body: OutcomeBody::Available("internal result".into()),
+                },
+            )
+            .await
+            .unwrap();
+        drop(session);
+        drop(runtime);
+
+        // Replay preserves the symbolic label; a real membership question still refuses.
+        let runtime = Runtime::open(config_with(policy, None), db, None).unwrap();
+        assert_eq!(runtime.status(&root()).unwrap().audience, "internal");
+        let session = runtime.session(&root(), &root()).unwrap();
+        assert!(matches!(
             session
-                .on_tool_result(
-                    read,
-                    ToolOutcome::Success {
-                        body: OutcomeBody::Available("internal result".into()),
+                .on_tool_call(
+                    ProposedCall {
+                        tool: "send_reader".into(),
+                        arguments: raw(serde_json::json!({})),
+                        cwd: None,
                     },
+                    false
                 )
                 .await
-                .unwrap();
-            drop(session);
-            drop(runtime);
-
-            // Replay preserves the symbolic label; a real membership question still refuses.
-            let runtime = Runtime::open(config_with(&policy, None), db, None).unwrap();
-            assert_eq!(runtime.status(&root()).unwrap().audience, "internal");
-            let session = runtime.session(&root(), &root()).unwrap();
-            assert!(matches!(
-                session
-                    .on_tool_call(
-                        ProposedCall {
-                            tool: "send_reader".into(),
-                            arguments: raw(serde_json::json!({})),
-                            cwd: None,
-                        },
-                        false
-                    )
-                    .await
-                    .unwrap(),
-                ToolCallDecision::Deny { .. }
-            ));
-        }
+                .unwrap(),
+            ToolCallDecision::Deny { .. }
+        ));
     }
 
     const ATTENTION: &str = r#"
@@ -5910,8 +5972,8 @@ delta = {}
             session,
             spawn,
             SpawnKind::FanOut,
-            None,
-            crate::engine::LabelSpelling::default(),
+            appa_runtime_api::OfferedReturn::AsSpoken,
+            Some(crate::engine::LabelSpelling::default()),
         )
         .await;
         session
@@ -6055,8 +6117,8 @@ delta = {}
             &session,
             fetch(serde_json::json!({"a": 1})),
             SpawnKind::FanOut,
-            None,
-            crate::engine::LabelSpelling::default(),
+            appa_runtime_api::OfferedReturn::AsSpoken,
+            Some(crate::engine::LabelSpelling::default()),
         )
         .await;
         let refused = session
@@ -8489,5 +8551,175 @@ delta = {}
                 "an offer replays only for the trajectory that pursued it"
             );
         }
+    }
+}
+
+/// Writers of one family on PostgreSQL, each driving its own event at the same moment
+/// through the runtime's shared store: the steps take turns on the family's row, so none
+/// loses its append, and no connection is held past its step.
+#[cfg(all(test, feature = "postgres"))]
+mod postgres_family_writers {
+    use super::super::{OutcomeBody, Runtime};
+    use super::*;
+    use crate::api::{ToolCallDecision, ToolOutcome, ToolResultDecision};
+    use crate::config::Config;
+    use appa_eventlog::{Backend, LogStore};
+
+    const POLICY: &str = r#"
+[policy]
+version = 2
+
+[[policy.tool]]
+name = "fetch"
+parameters = { type = "object", properties = { a = { type = "integer" } } }
+delta = {}
+
+[externals]
+timeout_ms = 2000
+max_body_bytes = 65536
+"#;
+
+    fn fetch(a: i64) -> ProposedCall {
+        ProposedCall {
+            tool: "fetch".to_string(),
+            arguments: serde_json::value::to_raw_value(&serde_json::json!({ "a": a })).expect("the call serializes"),
+            cwd: None,
+        }
+    }
+
+    /// A runtime over a pool of `connections`, and a fresh root opened in it.
+    fn opened(connections: usize) -> (Arc<Runtime>, Arc<LogStore>, TrajectoryId) {
+        let dir = tempfile::tempdir().expect("a temp dir is creatable");
+        let path = dir.path().join("appa.toml");
+        std::fs::write(&path, POLICY).expect("the fixture writes");
+        let config = Config::load(&path).expect("the fixture validates");
+        let url = std::env::var("OPENAPPA_TEST_DATABASE_URL").expect("test database URL");
+        let store = Arc::new(
+            LogStore::open(Backend::Postgres {
+                url,
+                max_connections: std::num::NonZeroUsize::new(connections).expect("a pool holds a connection"),
+            })
+            .expect("the PostgreSQL store opens"),
+        );
+        let runtime = Arc::new(Runtime::open_with_store(config, Arc::clone(&store), None).expect("the runtime opens"));
+        let root = TrajectoryId(format!("pg-writers:{}", dir.path().display()));
+        runtime.create_session(root.clone(), None).expect("a fresh id opens");
+        (runtime, store, root)
+    }
+
+    fn forget(store: &LogStore, root: &TrajectoryId) {
+        let key = root.0.clone();
+        store
+            .lease()
+            .expect("a connection leases")
+            .postgres()
+            .expect("the PostgreSQL API is present")
+            .with_client(move |client| {
+                client.execute("DELETE FROM openappa_events WHERE root = $1", &[&key])?;
+                client.execute("DELETE FROM openappa_roots WHERE root = $1", &[&key])?;
+                Ok(())
+            })
+            .expect("the test root cleans up");
+    }
+
+    /// Propose `calls` at once, one task each.
+    async fn propose_together(
+        runtime: &Arc<Runtime>,
+        root: &TrajectoryId,
+        calls: Vec<(String, i64)>,
+    ) -> Vec<Result<ToolCallDecision, EventError>> {
+        let barrier = Arc::new(tokio::sync::Barrier::new(calls.len()));
+        let tasks: Vec<_> = calls
+            .into_iter()
+            .map(|(call_id, a)| {
+                let (runtime, root, barrier) = (Arc::clone(runtime), root.clone(), Arc::clone(&barrier));
+                tokio::spawn(async move {
+                    let session = runtime.session(&root, &root).expect("the session reattaches");
+                    barrier.wait().await;
+                    session
+                        .on_tool_call_identified(fetch(a), Some(call_id), None, None)
+                        .await
+                })
+            })
+            .collect();
+        let mut decisions = Vec::new();
+        for task in tasks {
+            decisions.push(task.await.expect("the task joins"));
+        }
+        decisions
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "requires OPENAPPA_TEST_DATABASE_URL and host migrations"]
+    async fn postgres_concurrent_calls_of_one_family_all_land() {
+        let writers = 16;
+        let (runtime, store, root) = opened(4);
+        let calls = (0..writers).map(|i| (format!("toolu-{i}"), i as i64)).collect();
+        for decision in propose_together(&runtime, &root, calls).await {
+            assert!(
+                matches!(decision, Ok(ToolCallDecision::Allow { .. })),
+                "every call releases: {decision:?}"
+            );
+        }
+        assert_eq!(runtime.open_dispatches(&root, &root).len(), writers);
+        forget(&store, &root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "requires OPENAPPA_TEST_DATABASE_URL and host migrations"]
+    async fn postgres_concurrent_results_of_one_family_all_land() {
+        let writers = 16;
+        let (runtime, store, root) = opened(4);
+        let session = runtime.session(&root, &root).expect("the session reattaches");
+        for i in 0..writers {
+            session
+                .on_tool_call_identified(fetch(i as i64), Some(format!("toolu-{i}")), None, None)
+                .await
+                .expect("the call releases");
+        }
+        let barrier = Arc::new(tokio::sync::Barrier::new(writers));
+        let tasks: Vec<_> = (0..writers)
+            .map(|i| {
+                let (runtime, root, barrier) = (Arc::clone(&runtime), root.clone(), Arc::clone(&barrier));
+                tokio::spawn(async move {
+                    let session = runtime.session(&root, &root).expect("the session reattaches");
+                    barrier.wait().await;
+                    session
+                        .on_tool_result_identified(
+                            fetch(i as i64),
+                            Some(format!("toolu-{i}")),
+                            ToolOutcome::Success {
+                                body: OutcomeBody::Available("ok".to_string()),
+                            },
+                        )
+                        .await
+                })
+            })
+            .collect();
+        for task in tasks {
+            assert_eq!(
+                task.await.expect("the task joins").expect("every result lands"),
+                ToolResultDecision::Keep
+            );
+        }
+        assert!(runtime.open_dispatches(&root, &root).is_empty());
+        forget(&store, &root);
+    }
+
+    /// One host call delivered by several dispatches at once, as a retry racing the first
+    /// delivery would: every driver gets the one decision, and one dispatch opens.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "requires OPENAPPA_TEST_DATABASE_URL and host migrations"]
+    async fn postgres_one_call_from_many_drivers_opens_one_dispatch() {
+        let (runtime, store, root) = opened(4);
+        let calls = (0..8).map(|_| ("toolu-same".to_string(), 7)).collect();
+        for decision in propose_together(&runtime, &root, calls).await {
+            assert!(
+                matches!(decision, Ok(ToolCallDecision::Allow { .. })),
+                "every driver gets the release: {decision:?}"
+            );
+        }
+        assert_eq!(runtime.open_dispatches(&root, &root).len(), 1);
+        forget(&store, &root);
     }
 }

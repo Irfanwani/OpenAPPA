@@ -46,8 +46,8 @@ pub(crate) use appa_engine::engine::ForkStatus;
 use appa_engine::engine::{Engine, EngineError};
 use appa_engine::execute::{AuthorityEvidence, AuthorityReview};
 use appa_engine::fact::{
-    BoundaryKind, CloseOutcome, EffectKind, EffectSet, Fact, ReturnDerivation, ReturnPolicy, ReturnSanitizer,
-    RootForkOrigin,
+    BoundaryKind, CloseOutcome, CrossingReturn, EffectKind, EffectSet, Fact, ReturnDerivation, ReturnPolicy,
+    ReturnRoute, ReturnSanitizer, RootForkOrigin,
 };
 use appa_engine::label::{Audience, ChainAudience, Clause, DeclaredAudience, Label, ReaderId, SymbolicAtom, Trust};
 use appa_engine::names::MarkName;
@@ -79,8 +79,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::api::{EmbeddedPresentationOptions, OutcomeBody, RemedyDisplay, RemedyDisplayPlan, ToolNaming};
 pub(crate) use crate::api::{OfferId, ProposedCall, SpawnBinding, ToolOutcome, TrajectoryId};
 use crate::consult::{
-    AnnotationAnswer, AnnotationDeclaration, AuthorityAnswer, AuthorityArtifact, AuthorityDeclaration, ContextArtifact,
-    HistoryEntry, SanitizerArtifact, SanitizerDeclaration, SanitizerPoint,
+    AnnotationAnswer, AnnotationDeclaration, AnswerDelta, AuthorityAnswer, AuthorityArtifact, AuthorityDeclaration,
+    ContextArtifact, HistoryEntry, SanitizerArtifact, SanitizerDeclaration, SanitizerPoint,
 };
 use appa_runtime_api::{OfferedInputSanitizer, OfferedRemedy, OfferedReturn, Ruling, SpawnKind};
 
@@ -437,6 +437,7 @@ impl From<&TransitionRefusal> for ReplayRefusalClass {
             TransitionRefusal::UnbackedReturnPolicy => ReplayRefusalClass("unbacked_return_policy"),
             TransitionRefusal::ReturnShapeViolation => ReplayRefusalClass("return_shape_violation"),
             TransitionRefusal::ReturnBelowFloor => ReplayRefusalClass("return_below_floor"),
+            TransitionRefusal::ReturnVoid => ReplayRefusalClass("return_void"),
             TransitionRefusal::BranchEnded => ReplayRefusalClass("branch_ended"),
             TransitionRefusal::NotForked => ReplayRefusalClass("not_forked"),
             TransitionRefusal::WrongReturnIdentity => ReplayRefusalClass("wrong_return_identity"),
@@ -692,7 +693,7 @@ pub enum DispatchOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Opened {
     pub policy_file_key: String,
-    pub policy_identity: String,
+    pub policy_digest: appa_engine::profile::PolicyIdentity,
 }
 
 /// Where a trajectory stands in its family's log, as [`RuntimeEngine::liveness`]
@@ -734,9 +735,15 @@ impl PolicyEngine<'_> {
     }
 
     /// The policy identity of the deciding engine, lowercase hex — what
-    /// a root's opening record must name.
+    /// a root's opening record names when this engine opens it.
     pub fn identity_hex(&self) -> String {
         hex(self.engine().engine.identity().bytes())
+    }
+
+    /// Whether an opening record's digest names the deciding engine's policy, under the
+    /// current identity algorithm or an earlier one ([`appa_engine::engine::Engine::recognizes`]).
+    pub fn recognizes(&self, digest: &appa_engine::profile::PolicyIdentity) -> bool {
+        self.engine().engine.recognizes(digest)
     }
 }
 
@@ -753,7 +760,7 @@ pub(crate) fn opened_under(log: &Log) -> Option<Opened> {
             ..
         })) => Some(Opened {
             policy_file_key: policy_file_key.as_str().to_string(),
-            policy_identity: hex(policy_digest.bytes()),
+            policy_digest: *policy_digest,
         }),
         _ => None,
     }
@@ -775,6 +782,88 @@ pub struct RuntimeEngine {
     /// model to run one names it the way that model's harness dispatches it. A property of
     /// the deployment, not of the policy: a retired engine decides under the same one.
     naming: ToolNaming,
+    /// The views this engine built last, one per family; see [`RuntimeEngine::rebuild_view`].
+    views: HeldViews,
+}
+
+/// How many families' views one engine holds at most.
+const HELD_VIEWS: usize = 128;
+
+/// The last view this engine built for each of a bounded number of families, so the next read
+/// of a family validates only the batches its log accepted since rather than the whole log.
+#[derive(Default)]
+struct HeldViews {
+    held: std::sync::Mutex<HeldFamilies>,
+}
+
+#[derive(Default)]
+struct HeldFamilies {
+    views: std::collections::HashMap<TrajectoryId, HeldView>,
+    /// Families in the order they were last used, oldest first.
+    order: std::collections::VecDeque<TrajectoryId>,
+}
+
+struct HeldView {
+    view: EngineView,
+    basis: u64,
+    facts: usize,
+    /// The view's last record, which a later log of the family must still hold at that
+    /// position for the view to describe it.
+    last: Option<Fact>,
+}
+
+impl HeldViews {
+    fn held(&self) -> std::sync::MutexGuard<'_, HeldFamilies> {
+        self.held
+            .lock()
+            .expect("the held views mutex is never poisoned: no panic runs while it is held")
+    }
+
+    /// `log`'s view, advanced from a held view of a prefix of `log` through the batches the
+    /// log accepted since. `None` when no held view describes a prefix of `log`, or a batch
+    /// is refused: the caller then rebuilds from the whole log.
+    fn advanced(&self, engine: &Engine, log: &Log) -> Option<EngineView> {
+        let (mut view, basis) = {
+            let held = self.held();
+            let found = held.views.get(log.root())?;
+            let same_prefix = found.basis <= log.basis()
+                && found.facts <= log.facts().len()
+                && found.facts.checked_sub(1).map(|last| &log.facts()[last]) == found.last.as_ref();
+            if !same_prefix {
+                return None;
+            }
+            (found.view.clone(), found.basis)
+        };
+        for batch in log.batches_after(basis)? {
+            engine.admit_batch(&mut view, batch.to_vec()).ok()?;
+        }
+        Some(view)
+    }
+
+    fn keep(&self, log: &Log, view: &EngineView) {
+        let mut held = self.held();
+        // The family was used now, whether or not this view replaces the held one.
+        held.order.retain(|family| family != log.root());
+        held.order.push_back(log.root().clone());
+        if !held
+            .views
+            .get(log.root())
+            .is_some_and(|found| found.basis > log.basis())
+        {
+            let fresh = HeldView {
+                view: view.clone(),
+                basis: log.basis(),
+                facts: log.facts().len(),
+                last: log.facts().last().cloned(),
+            };
+            held.views.insert(log.root().clone(), fresh);
+        }
+        while held.order.len() > HELD_VIEWS {
+            if let Some(oldest) = held.order.pop_front() {
+                held.views.remove(&oldest);
+            }
+        }
+    }
 }
 
 impl RuntimeEngine {
@@ -820,6 +909,7 @@ impl RuntimeEngine {
                 .map(|(name, binding)| (name.as_str().to_string(), binding.clone()))
                 .collect(),
             naming,
+            views: HeldViews::default(),
         }
     }
 
@@ -864,8 +954,28 @@ impl RuntimeEngine {
     /// opening gate: the log's first record must be this root's opening under
     /// exactly the deciding engine's policy. The root is the log's own, so a
     /// view cannot be built against a log it does not describe.
+    ///
+    /// A family's last view is held, and a later log that still holds that view's records is
+    /// validated only from where the view stands, batch by batch, through the validator a sealed
+    /// batch passes. That view equals the one a replay of the whole log builds; anything the
+    /// advance refuses is judged by that whole replay instead.
     pub(crate) fn rebuild_view(&self, log: &Log) -> Result<EngineView, EngineRefusal> {
-        self.validated(log.facts().to_vec(), log.root(), log.basis())
+        let view = match self.views.advanced(&self.engine, log) {
+            Some(view) => {
+                // Every debug test build checks the advance against a whole replay.
+                #[cfg(all(test, debug_assertions))]
+                assert_eq!(
+                    view,
+                    self.validated(log.facts().to_vec(), log.root(), log.basis())
+                        .expect("a whole replay accepts every log an advance accepts"),
+                    "an advanced view equals the view a replay of the whole log builds"
+                );
+                view
+            }
+            None => self.validated(log.facts().to_vec(), log.root(), log.basis())?,
+        };
+        self.views.keep(log, &view);
+        Ok(view)
     }
 
     /// Where this trajectory stands in the log:
@@ -1619,7 +1729,6 @@ impl RuntimeEngine {
                 match gap {
                     Gap::TrustFloor { .. } => "trust_floor",
                     Gap::Includes { .. } => "includes",
-                    Gap::Cap { .. } => "cap",
                     Gap::Prior(_) => "prior",
                     Gap::NoPrior(_) => "no_prior",
                     Gap::Attention(_) => "attention",
@@ -1667,11 +1776,12 @@ impl RuntimeEngine {
                         })
                     });
                 let returns = plan.and_then(|plan| {
-                    plan.return_step().map(|sanitizer| match sanitizer {
-                        None => OfferedReturn::AsSpoken,
-                        Some(name) => OfferedReturn::Sanitized {
+                    plan.return_step().map(|route| match route {
+                        ReturnRoute::Raw => OfferedReturn::AsSpoken,
+                        ReturnRoute::Sanitized(name) => OfferedReturn::Sanitized {
                             sanitizer: name.as_str().to_string(),
                         },
+                        ReturnRoute::Void => OfferedReturn::Void,
                     })
                 });
                 let input_sanitizer = plan.and_then(|plan| {
@@ -2082,8 +2192,9 @@ impl RuntimeEngine {
     }
 
     /// The return policy an offer's execution declares, where its plan ends in a return step:
-    /// the floor, spelled as a delta over this trajectory's current label, and the schema an
-    /// attesting plan needs. A plan with no return step takes none, whatever was passed.
+    /// no return, which takes no argument, or the floor, spelled as a delta over this
+    /// trajectory's current label, and the schema an attesting plan needs. A plan with no return
+    /// step takes none, whatever was passed.
     fn declared_return_policy(
         &self,
         view: &EngineView,
@@ -2092,12 +2203,26 @@ impl RuntimeEngine {
         offer: &EngineOfferId,
         arguments: &RemedyArguments,
     ) -> Result<Option<ReturnPolicy>, String> {
-        let Some(step) = self
+        let Some(route) = self
             .engine
             .offer_plan(view, owner, offer)
-            .and_then(|plan| plan.return_step().map(|sanitizer| sanitizer.cloned()))
+            .and_then(|plan| plan.return_step().cloned())
         else {
             return Ok(None);
+        };
+        let step = match route {
+            ReturnRoute::Void => {
+                return match (&arguments.label, &arguments.return_schema) {
+                    (None, None) => Ok(Some(ReturnPolicy::Void)),
+                    _ => Err(
+                        "this plan takes no return from the subagent, so it takes no `label` or \
+                              `return_schema`: omit them"
+                            .to_string(),
+                    ),
+                };
+            }
+            ReturnRoute::Raw => None,
+            ReturnRoute::Sanitized(name) => Some(name),
         };
         let Some(spelling) = &arguments.label else {
             return Err(
@@ -2151,7 +2276,7 @@ impl RuntimeEngine {
             None => None,
             Some(name) => Some(ReturnSanitizer::Named(name)),
         };
-        Ok(Some(ReturnPolicy { floor, sanitizer }))
+        Ok(Some(ReturnPolicy::Crossing(CrossingReturn { floor, sanitizer })))
     }
 
     /// Return contract context provided to a starting subagent.
@@ -2161,8 +2286,18 @@ impl RuntimeEngine {
         parent: &TrajectoryId,
         fork: &appa_engine::value::ForkId,
     ) -> Option<String> {
-        let policy = self.engine.prepared_return_policy(view, parent, fork)?;
-        match policy.sanitizer? {
+        let crossing = match self.engine.prepared_return_policy(view, parent, fork)? {
+            ReturnPolicy::Void => {
+                return Some(
+                    "[appa] Your parent takes no return from you: nothing in your final message crosses to it. Do \
+                     the task with your own tools, then end with an empty final message (send no text or \
+                     explanation). A stop with text is blocked."
+                        .to_string(),
+                );
+            }
+            ReturnPolicy::Crossing(crossing) => crossing,
+        };
+        match crossing.sanitizer? {
             ReturnSanitizer::Attest(shape) => Some(format!(
                 "[appa] Your final message is checked when you stop: it must be one JSON object matching this \
                  schema, and nothing else. A stop that does not match is blocked with the reason; a stop that \
@@ -2301,6 +2436,13 @@ impl RuntimeEngine {
                      message (send no text or explanation) to end without a return.",
                     self.label_text(&floor)
                 ));
+            }
+            AudienceRound::Failed(TransitionError::ReturnVoid) => {
+                return blocked(
+                    "[appa] your parent takes no return from this session, so your final message cannot cross. \
+                     Stop with an empty final message (send no text or explanation)."
+                        .to_string(),
+                );
             }
             AudienceRound::Failed(TransitionError::ReturnShapeMismatch(mismatch)) => {
                 let policy = self.engine.return_policy_of(view, child);
@@ -2493,20 +2635,18 @@ impl RuntimeEngine {
                 .rank_of(name)
                 .expect("a decoded annotation answer names declared ranks")
         };
-        let mut requirements = Vec::new();
-        if let Some(required) = &answer.required_audience {
-            if let Some(includes) = &required.includes {
-                requirements.push(AudienceRequirement::Includes(RecipientSpec::Static(includes.clone())));
-            }
-            if let Some(cap) = &required.cap {
-                requirements.push(AudienceRequirement::Cap(cap.clone()));
-            }
-        }
+        let requirements = answer
+            .required_audience
+            .iter()
+            .map(|includes| AudienceRequirement::Includes(RecipientSpec::Static(includes.clone())))
+            .collect();
+        let delta = |answered: &AnswerDelta| Delta {
+            trust: answered.trust.as_deref().map(rank),
+            audience: answered.audience.clone().map(DeltaAudience::Static),
+        };
         ProducedAnnotation {
-            delta: Delta {
-                trust: answer.delta_trust.as_deref().map(rank),
-                audience: answer.delta_audience.clone().map(DeltaAudience::Static),
-            },
+            delta: delta(&answer.delta),
+            forwards: delta(&answer.forwards),
             emits: EffectSet::new(answer.emits.iter().map(|kind| EffectKind::new(kind.as_str())))
                 .expect("a decoded annotation answer holds no duplicate effect"),
             requires: Requires {
@@ -3587,8 +3727,6 @@ fn gap_text(gap: &appa_engine::check::Gap, chain: &TrustChain) -> String {
                 )
             }
         },
-        // Count only: a cap may read a directory group's members.
-        Gap::Cap { cap } => format!("the committed readers exceed the cap of {}", declared_count(cap)),
         Gap::Prior(effect) => format!("requires a prior {} effect", effect.as_str()),
         Gap::NoPrior(effect) => format!("forbidden after a {} effect", effect.as_str()),
         Gap::Attention(mark) => format!("requires attention: {}", mark.as_str()),
@@ -3662,16 +3800,10 @@ fn clause_size(clause: &Clause) -> usize {
     clause.readers().len() + clause.groups().count() + usize::from(clause.chain().is_some())
 }
 
-fn declared_count(audience: &DeclaredAudience) -> String {
-    match audience {
-        DeclaredAudience::Public => "public".to_string(),
-        DeclaredAudience::Union(clause) => clause_count(clause),
-    }
-}
-
 fn shape_feedback(mismatch: &ReturnMismatch, policy: Option<&ReturnPolicy>) -> String {
     let schema = policy
-        .and_then(|policy| policy.sanitizer.as_ref())
+        .and_then(ReturnPolicy::crossing)
+        .and_then(|crossing| crossing.sanitizer.as_ref())
         .and_then(ReturnSanitizer::shape)
         .map(|shape| shape.normalized().to_string())
         .unwrap_or_default();
@@ -3746,7 +3878,7 @@ impl ReturnSpelling {
 }
 
 fn return_instruction(
-    sanitizer: Option<&appa_engine::names::SanitizerName>,
+    route: &ReturnRoute,
     id: &OfferId,
     spelling: &ReturnSpelling,
     control: &str,
@@ -3754,8 +3886,17 @@ fn return_instruction(
     include_display_plan: bool,
 ) -> String {
     let ReturnSpelling { floor, ranks } = spelling;
-    let body = match sanitizer {
-        None => {
+    let body = match route {
+        ReturnRoute::Void => {
+            let call = remedy_call(control, id, "", description, include_display_plan);
+            format!(
+                "  - Take no return when this session needs no answer from the subagent, for example when it acts \
+             through its own tools. Then call the subagent tool again with the same arguments. Nothing in its final \
+             message crosses, so this session's label never changes through it, and no floor bounds what it may read \
+             or accept. The subagent must end with an empty final message; a stop with text is blocked.\n    {call}"
+            )
+        }
+        ReturnRoute::Raw => {
             let call = remedy_call(
                 control,
                 id,
@@ -3768,12 +3909,14 @@ fn return_instruction(
              tool again with the same arguments. The subagent starts at this session's label, now {floor}. Its floor \
              must cover every narrowing its task needs. Set `trust` to the lowest rank it may read and `audience` to \
              the narrowest audience its data may be confined to. Remove either field from the call when that dimension \
-             should keep its current value. Returning no final value does not relax this floor.\n    {call}, with \
+             should keep its current value. A returned value combines its label with this session's and can narrow \
+             this session: under this floor it carries the subagent's label. Returning no final value adds nothing to \
+             this session's label, and it does not relax this floor.\n    {call}, with \
              <rank> one of {ranks} (lowest first), and each <audience-entry> a built-in audience, configured group, \
              or reader ID from the policy; add audience entries as needed"
             )
         }
-        Some(name) if name.is_attest_schema() => {
+        ReturnRoute::Sanitized(name) if name.is_attest_schema() => {
             let call = remedy_call(
                 control,
                 id,
@@ -3794,7 +3937,7 @@ fn return_instruction(
              from the policy; add audience entries as needed"
             )
         }
-        Some(name) => {
+        ReturnRoute::Sanitized(name) => {
             let call = remedy_call(
                 control,
                 id,
@@ -3806,8 +3949,9 @@ fn return_instruction(
                 "  - Have sanitizer {} rewrite the subagent's return before this session receives it, and declare the \
              floor. The floor must cover every narrowing its task needs on dimensions the sanitizer does not raise, even \
              when the subagent returns no final value. Set every bound dimension low enough for the data the subagent \
-             must read.\n    {call}, with <rank> one of {ranks} (lowest first), and each \
-             <audience-entry> a built-in audience, configured group, or reader ID from the policy; add audience entries \
+             must read. A returned value combines its sanitized label with this session's and can narrow this session \
+             on the dimensions the sanitizer does not raise; returning no final value adds nothing.\n    {call}, with \
+             <rank> one of {ranks} (lowest first), and each <audience-entry> a built-in audience, configured group, or reader ID from the policy; add audience entries \
              as needed",
                 terminal_safe(name.as_str()),
             )
@@ -3818,13 +3962,14 @@ fn return_instruction(
     format!("{body}\n    This declaration covers this one subagent call. Each call in a fan-out declares its own.")
 }
 
-fn return_description(sanitizer: Option<&appa_engine::names::SanitizerName>) -> String {
-    match sanitizer {
-        None => "Declare the lowest label this session accepts from the subagent's return".to_string(),
-        Some(name) if name.is_attest_schema() => {
+fn return_description(route: &ReturnRoute) -> String {
+    match route {
+        ReturnRoute::Raw => "Declare the lowest label this session accepts from the subagent's return".to_string(),
+        ReturnRoute::Sanitized(name) if name.is_attest_schema() => {
             "Declare the return label and the JSON schema it must satisfy".to_string()
         }
-        Some(name) => format!(
+        ReturnRoute::Void => "Take no return from the subagent".to_string(),
+        ReturnRoute::Sanitized(name) => format!(
             "Have sanitizer {} rewrite the subagent's return and declare the floor",
             terminal_safe(name.as_str())
         ),
@@ -3855,7 +4000,7 @@ fn remedy_action(plan: &ExecutableRemedyPlan, registry: Option<&Registry>, targe
                 "Run the tool and withhold its result".to_string()
             };
         }
-        match (needs_approval, plan.narrowing().is_some(), plan.sanitizer()) {
+        match (needs_approval, plan.narrowing(), plan.sanitizer()) {
             (true, _, Some(sanitizer)) => {
                 format!(
                     "Submit for approval and use sanitizer {}'s result",
@@ -3865,17 +4010,39 @@ fn remedy_action(plan: &ExecutableRemedyPlan, registry: Option<&Registry>, targe
             (false, _, Some(sanitizer)) => {
                 format!("Use sanitizer {}'s result", terminal_safe(sanitizer.as_str()))
             }
-            (true, true, None) => "Submit for approval and accept this change for the rest of this session".to_string(),
-            (false, true, None) => "Accept this change for the rest of this session".to_string(),
-            (true, false, None) => "Submit for approval".to_string(),
-            (false, false, None) => "Apply the offered remedy".to_string(),
+            (true, Some(narrowing), None) => format!(
+                "Submit for approval and accept {} for the rest of this session",
+                narrowing_change(narrowing)
+            ),
+            (false, Some(narrowing), None) => {
+                format!("Accept {} for the rest of this session", narrowing_change(narrowing))
+            }
+            (true, None, None) => "Submit for approval".to_string(),
+            (false, None, None) => "Apply the offered remedy".to_string(),
         }
+    }
+}
+
+/// The change a narrowing plan asks the model to accept, in the words of the reasons
+/// `narrowing_feedback` gives: "session trust would fall", "allowed readers would narrow".
+fn narrowing_change(narrowing: &appa_engine::check::Narrowing) -> &'static str {
+    // The engine builds a narrowing only where the label moves, so one dimension changes.
+    debug_assert_ne!(narrowing.from, narrowing.to, "a narrowing changes trust or readers");
+    match (
+        narrowing.from.trust != narrowing.to.trust,
+        narrowing.from.audience != narrowing.to.audience,
+    ) {
+        (true, true) => "lower trust and narrower readers",
+        (true, false) => "lower trust",
+        (false, true) => "narrower readers",
+        // The assert above rules this out; a release build keeps a neutral label.
+        (false, false) => "this change",
     }
 }
 
 fn remedy_description(plan: &ExecutableRemedyPlan, registry: Option<&Registry>, target: &str) -> String {
     match plan.return_step() {
-        Some(sanitizer) => return_description(sanitizer),
+        Some(route) => return_description(route),
         None => remedy_action(plan, registry, target),
     }
 }
@@ -3898,13 +4065,17 @@ fn remedy_instruction(
     include_display_plan: bool,
 ) -> String {
     let description = remedy_description(plan, registry, target);
-    if let Some(sanitizer) = plan.return_step() {
-        return return_instruction(sanitizer, id, spelling, control, &description, include_display_plan);
+    if let Some(route) = plan.return_step() {
+        return return_instruction(route, id, spelling, control, &description, include_display_plan);
     }
-    let mut instruction = format!(
-        "  - {description}:\n    {}",
-        remedy_call(control, id, "", &description, include_display_plan)
-    );
+    let call = remedy_call(control, id, "", &description, include_display_plan);
+    // The display plan is the call's own `plan` argument, so it names the remedy. A second
+    // label line would print the same text twice.
+    let mut instruction = if include_display_plan {
+        format!("  - {call}")
+    } else {
+        format!("  - {description}:\n    {call}")
+    };
     let needs_approval = !plan.required.is_empty();
     if needs_approval {
         if include_display_plan {
@@ -4043,6 +4214,29 @@ fn block_feedback(
     if let Some(narrowing) = &planned.raw.narrowing {
         reasons.extend(narrowing_feedback(narrowing, chain));
     }
+    if let Some(impact) = &planned.narrowing_impact {
+        if impact.sign_off + impact.blocked > 0 {
+            reasons.push(format!(
+                "Accepting restricts {} of {} tools for this session: {} will need sign-off, {} will be blocked.",
+                impact.sign_off + impact.blocked,
+                impact.tools,
+                impact.sign_off,
+                impact.blocked
+            ));
+        }
+        if !impact.recipient_checked.is_empty() {
+            let tools = impact
+                .recipient_checked
+                .iter()
+                .map(|tool| format!("`{}`", terminal_safe(&naming.model_spelling(tool.as_str()))))
+                .collect::<Vec<_>>()
+                .join(", ");
+            reasons.push(format!(
+                "{tools} can check recipients against the readers of what they send. After accepting, a recipient \
+                 outside this session's readers fails that check unless a remedy covers it."
+            ));
+        }
+    }
     if planned.plans.iter().any(|plan| match plan {
         RemedyPlan::Executable(plan) => plan.return_step().is_some(),
         RemedyPlan::Redispatch(_) => false,
@@ -4054,8 +4248,11 @@ fn block_feedback(
         ));
     }
 
+    // Name the call the way the model spelled it, never its arguments.
+    let target = naming.model_spelling(target);
+    let target = target.as_str();
     let mut lines = vec![
-        "[appa] Blocked: this call cannot run yet.".to_string(),
+        format!("[appa] Blocked: {} cannot run yet.", terminal_safe(target)),
         String::new(),
         "Why:".to_string(),
     ];
@@ -4094,10 +4291,26 @@ fn block_feedback(
             fork_advice_text(advice, remedies_required).replace('\n', "\n  ")
         ));
     }
+    if let Some(yell) = &presentation.yell_tool {
+        lines.push(String::new());
+        lines.push("Report:".to_string());
+        lines.push(format!("  {}", report_text(yell)));
+    }
     RenderedBlock {
         text: lines.join("\n"),
         display,
     }
+}
+
+/// Points the model at the host's reporting tool. A block reaches the model before it asks
+/// the person again, so this is where it learns that a plan which makes no sense, a run of
+/// blocks, or a person tired of approving is worth reporting instead of retrying.
+fn report_text(yell: &str) -> String {
+    format!(
+        "If a plan makes no sense, you keep getting blocked, the user keeps being asked to approve similar \
+         calls, or the user is frustrated, call {}.",
+        terminal_safe(yell)
+    )
 }
 
 fn fork_heading(advice: ForkAdvice) -> &'static str {
@@ -4123,6 +4336,7 @@ fn fork_advice_text(advice: ForkAdvice, remedies_required: bool) -> String {
     let ForkAdvice::Narrowing {
         standing,
         sanitized_return,
+        preserving_output,
     } = advice
     else {
         return "If a child-session or subagent tool is available, handle the work there if isolation is \
@@ -4134,11 +4348,22 @@ fn fork_advice_text(advice: ForkAdvice, remedies_required: bool) -> String {
     } else {
         "this call and all work that uses its result"
     };
-    let declare_floor = "When the spawn asks for a return declaration, choose a floor and sanitizer whose combined \
-                         route permits every narrowing the delegated work needs. A sanitizer unbinds only the dimension \
-                         it raises. Returning nothing controls what crosses back; it does not relax what the child may \
-                         read or accept under that route.";
-    match (standing, sanitized_return) {
+    let declare_floor = "When the spawn asks for a return declaration and this session needs no answer from the \
+                         delegated work, take no return: no floor then bounds what the child may read or accept, and \
+                         nothing crosses back. Otherwise choose a floor and sanitizer whose combined route permits \
+                         every narrowing the delegated work needs. A sanitizer unbinds only the dimension it raises. \
+                         Under a floor, an empty final message controls what crosses back; it does not relax what the \
+                         child may read or accept.";
+    let preferred = match (standing, preserving_output) {
+        (FloorStanding::Unbound | FloorStanding::Within, true) => {
+            "An output sanitizer offered under Continue can admit this result without changing this session's \
+             label, if its required steps succeed. Prefer that offer to the routes below.\n"
+        }
+        (FloorStanding::Below, _) | (_, false) => "",
+    };
+    let returned = "A final message the parent admits crosses to it and can narrow its label. When the task needs \
+                    no return, end with an empty final message to leave the parent's label unchanged.";
+    let route = match (standing, sanitized_return) {
         (FloorStanding::Unbound, true) => format!(
             "If a child-session or subagent tool is available, delegate {delegated} there.\n{declare_floor}\nFinish \
              there by returning nothing, or choose a registered return sanitizer whose declared permit covers the \
@@ -4152,30 +4377,34 @@ fn fork_advice_text(advice: ForkAdvice, remedies_required: bool) -> String {
         (FloorStanding::Within, true) => format!(
             "This session is a subagent, and the floor its parent declared allows this change: accept it here.\nTo \
              keep this session unchanged instead, delegate {delegated} to a further subagent declared with a \
-             return sanitizer; one declared with the bare floor would apply the same change here on its return."
+             return sanitizer; one declared with the bare floor would apply the same change here on its return.\n\
+             {returned}"
         ),
-        (FloorStanding::Within, false) => {
+        (FloorStanding::Within, false) => format!(
             "This session is a subagent, and the floor its parent declared allows this change: accept it here.\nA \
-             further subagent's return would apply the same change to this session, so delegating gains nothing."
-                .to_string()
-        }
+             further subagent's return would apply the same change to this session, so delegating gains nothing.\n\
+             {returned}"
+        ),
         (FloorStanding::Below, true) => format!(
             "The parent does not allow this session to admit the raw result. This restriction does not forbid \
              an output sanitizer offered under Continue: execute that offer and retry the call.\nWithout an \
              output sanitizer, a further subagent under the bare floor cannot admit the raw result either. \
              A subagent started \
              here with a return sanitizer can: delegate {delegated} there, and declare that sanitizer when the \
-             spawn asks for the return declaration."
+             spawn asks for the return declaration. When this session needs no answer from that work, a subagent \
+             declared with no return can do it too."
         ),
         (FloorStanding::Below, false) => {
             "The parent does not allow this session to admit the raw result. This restriction does not forbid \
              an output sanitizer offered under Continue: execute that offer and retry the call.\nIf no output \
-             sanitizer is offered, finish without the raw result. A further subagent cannot bypass this floor, \
-             and no registered return sanitizer carries the change back. Tell the parent that the work needs \
-             a child declared with a lower floor or a return sanitizer."
+             sanitizer is offered and this session needs no answer from the work, delegate it to a further \
+             subagent declared with no return: nothing it holds crosses back. Otherwise finish without the raw \
+             result, because no registered return sanitizer carries the change back. Tell the parent that the work \
+             needs a child declared with a lower floor, a return sanitizer, or no return."
                 .to_string()
         }
-    }
+    };
+    format!("{preferred}{route}")
 }
 
 #[cfg(test)]
@@ -4188,7 +4417,7 @@ mod tests {
         terminal_safe, unresolved_audience,
     };
     use crate::api::{EmbeddedPresentationOptions, ToolNaming, ToolOutcome};
-    use crate::consult::{AnnotationAnswer, HistoryEntry, RequiredAudienceAnswer, SanitizerPoint};
+    use crate::consult::{AnnotationAnswer, AnswerDelta, HistoryEntry, SanitizerPoint};
     use appa_engine::check::{Gap, RawBlock};
     use appa_engine::contract::AnnotationContext;
     use appa_engine::contract::{AudienceRequirement, DeltaAudience, HistoryRequirement, RecipientSpec};
@@ -4233,6 +4462,7 @@ mod tests {
             let advice = super::ForkAdvice::Narrowing {
                 standing: super::FloorStanding::Below,
                 sanitized_return,
+                preserving_output: false,
             };
             assert_eq!(super::fork_heading(advice), "Refused by the parent's declaration:");
             let text = super::fork_advice_text(advice, false);
@@ -4240,6 +4470,31 @@ mod tests {
             assert!(text.contains("does not forbid an output sanitizer offered under Continue"));
             assert!(text.contains("execute that offer and retry the call"));
             assert!(!text.contains("Finish without this call"));
+        }
+    }
+
+    #[test]
+    fn a_label_preserving_output_offer_adds_advice_only_where_the_raw_change_is_allowed() {
+        use super::FloorStanding::{Below, Unbound, Within};
+        for (standing, extends) in [(Unbound, true), (Within, true), (Below, false)] {
+            for sanitized_return in [false, true] {
+                let text = |preserving_output| {
+                    super::fork_advice_text(
+                        super::ForkAdvice::Narrowing {
+                            standing,
+                            sanitized_return,
+                            preserving_output,
+                        },
+                        false,
+                    )
+                };
+                let (plain, preferred) = (text(false), text(true));
+                assert_eq!(
+                    preferred != plain && preferred.ends_with(&plain),
+                    extends,
+                    "{standing:?}, sanitized return {sanitized_return}"
+                );
+            }
         }
     }
 
@@ -4470,8 +4725,11 @@ mod tests {
         );
 
         let answer = AnnotationAnswer {
-            delta_trust: Some("trusted".to_string()),
-            delta_audience: Some(DeclaredAudience::Public),
+            delta: AnswerDelta {
+                trust: Some("trusted".to_string()),
+                audience: Some(DeclaredAudience::Public),
+            },
+            forwards: AnswerDelta::default(),
             required_trust: None,
             required_audience: None,
             history: Vec::new(),
@@ -4519,8 +4777,11 @@ mod tests {
             annotator: "classifier".to_string(),
             call: asked,
             answer: AnnotationAnswer {
-                delta_trust: Some("suspicious".to_string()),
-                delta_audience: None,
+                delta: AnswerDelta {
+                    trust: Some("suspicious".to_string()),
+                    audience: None,
+                },
+                forwards: AnswerDelta::default(),
                 required_trust: None,
                 required_audience: None,
                 history: Vec::new(),
@@ -4596,13 +4857,13 @@ mod tests {
         );
 
         let answer = || AnnotationAnswer {
-            delta_trust: Some("suspicious".to_string()),
-            delta_audience: Some(DeclaredAudience::Public),
+            delta: AnswerDelta {
+                trust: Some("suspicious".to_string()),
+                audience: Some(DeclaredAudience::Public),
+            },
+            forwards: AnswerDelta::default(),
             required_trust: Some("trusted".to_string()),
-            required_audience: Some(RequiredAudienceAnswer {
-                includes: Some(DeclaredAudience::restricted([ReaderId::new("support")])),
-                cap: Some(DeclaredAudience::Public),
-            }),
+            required_audience: Some(DeclaredAudience::restricted([ReaderId::new("support")])),
             history: vec![HistoryEntry::Excludes("send".to_string())],
             attention: Vec::new(),
             emits: vec!["read".to_string()],
@@ -4632,12 +4893,9 @@ mod tests {
         assert_eq!(produced.requires.label.trust_floor, Some(Trust::new(1)));
         assert_eq!(
             produced.requires.label.audience,
-            vec![
-                AudienceRequirement::Includes(RecipientSpec::Static(DeclaredAudience::restricted([ReaderId::new(
-                    "support"
-                )]))),
-                AudienceRequirement::Cap(DeclaredAudience::Public),
-            ]
+            vec![AudienceRequirement::Includes(RecipientSpec::Static(
+                DeclaredAudience::restricted([ReaderId::new("support")])
+            ))]
         );
         assert_eq!(
             produced.requires.history,
@@ -4697,6 +4955,7 @@ mod tests {
                 RemedyPlan::Executable(plan(8)),
             ],
             fork_advice: None,
+            narrowing_impact: None,
         };
         let offers = vec![
             (OfferId("offer-for-8".to_string()), PlanId::new(8)),
@@ -4797,6 +5056,7 @@ mod tests {
             },
             plans: vec![RemedyPlan::Redispatch(redispatch)],
             fork_advice: None,
+            narrowing_impact: None,
         };
         let spelling = super::ReturnSpelling {
             floor: "{}".to_string(),
@@ -4851,6 +5111,7 @@ mod tests {
             },
             plans: vec![RemedyPlan::Executable(plan)],
             fork_advice: None,
+            narrowing_impact: None,
         };
         let offers = vec![(OfferId("offer-1".to_string()), PlanId::new(1))];
         let spelling = super::ReturnSpelling {
@@ -4912,7 +5173,7 @@ mod tests {
     fn display_plans_describe_return_remedies_in_the_rendered_call() {
         let plan = ExecutableRemedyPlan {
             id: PlanId::new(1),
-            steps: vec![RemedyStep::Return(None)],
+            steps: vec![RemedyStep::Return(appa_engine::fact::ReturnRoute::Raw)],
             required: Vec::new(),
         };
         let instruction = remedy_instruction(
@@ -4942,11 +5203,167 @@ mod tests {
     }
 
     #[test]
+    fn a_narrowing_remedy_names_the_change_once_and_the_headline_names_the_tool() {
+        use appa_engine::check::Narrowing;
+        use appa_engine::label::ReaderId;
+        use appa_engine::label::{Audience, Label};
+
+        let from = Label::new(Trust::new(2), Audience::public());
+        let narrower = Audience::restricted([ReaderId::new("alice")]);
+        let cases = [
+            (Label::new(Trust::new(0), Audience::public()), "lower trust"),
+            (Label::new(Trust::new(2), narrower.clone()), "narrower readers"),
+            (
+                Label::new(Trust::new(0), narrower.clone()),
+                "lower trust and narrower readers",
+            ),
+        ];
+        let policy = appa_policy::Config::from_toml_str("version = 2").expect("the policy compiles");
+        for (to, change) in cases {
+            for (include_display_plan, required) in [(false, false), (false, true), (true, false), (true, true)] {
+                let planned = PlannedBlock {
+                    raw: RawBlock {
+                        requirement_gaps: vec![],
+                        narrowing: Some(Narrowing {
+                            from: from.clone(),
+                            to: to.clone(),
+                        }),
+                    },
+                    plans: vec![RemedyPlan::Executable(ExecutableRemedyPlan {
+                        id: PlanId::new(1),
+                        steps: vec![RemedyStep::Accept(Narrowing {
+                            from: from.clone(),
+                            to: to.clone(),
+                        })],
+                        required: if required {
+                            vec![appa_engine::plan::RequiredRuling {
+                                authority: appa_engine::names::AuthorityName::new("officer"),
+                                covers: Vec::new(),
+                            }]
+                        } else {
+                            Vec::new()
+                        },
+                    })],
+                    fork_advice: None,
+                    narrowing_impact: None,
+                };
+                let options = EmbeddedPresentationOptions {
+                    control_tool: "approve_remedy".to_string(),
+                    supports_delegation: false,
+                    include_display_plan,
+                    yell_tool: None,
+                };
+                let feedback = block_feedback(
+                    &planned,
+                    &[(OfferId("0123456789abcdef".to_string()), PlanId::new(1))],
+                    policy.engine().registry(),
+                    &ReturnBounds {
+                        label: appa_engine::label::Label::top(),
+                        lowest: Trust::new(0),
+                    },
+                    ToolNaming::AsAuthored,
+                    "send_mail",
+                    &options,
+                );
+                let label = if required {
+                    format!("Submit for approval and accept {change} for the rest of this session")
+                } else {
+                    format!("Accept {change} for the rest of this session")
+                };
+                let text = feedback.text;
+                assert!(text.starts_with("[appa] Blocked: send_mail cannot run yet."), "{text}");
+                assert_eq!(text.matches(&label).count(), 1, "the label appears once: {text}");
+                assert!(!text.contains("Accept this change"), "{text}");
+                if include_display_plan {
+                    assert!(
+                        text.contains(&format!(
+                            "  - approve_remedy(offer_id: \"0123456789abcdef\", plan: \"{label}\")"
+                        )),
+                        "{text}"
+                    );
+                    assert_eq!(
+                        feedback.display.expect("display plan").plans[0].text.split('\n').next(),
+                        Some(label.as_str())
+                    );
+                } else {
+                    assert!(text.contains(&format!("  - {label}:\n    ")), "{text}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_narrowing_impact_adds_a_reason_per_part() {
+        use appa_engine::check::Narrowing;
+        use appa_engine::label::{Audience, Label};
+        use appa_engine::plan::NarrowingImpact;
+
+        let policy = appa_policy::Config::from_toml_str("version = 2").expect("the policy compiles");
+        let reasons = |narrowing_impact| {
+            let planned = PlannedBlock {
+                raw: RawBlock {
+                    requirement_gaps: vec![],
+                    narrowing: Some(Narrowing {
+                        from: Label::new(Trust::new(2), Audience::public()),
+                        to: Label::new(Trust::new(0), Audience::public()),
+                    }),
+                },
+                plans: vec![],
+                fork_advice: None,
+                narrowing_impact,
+            };
+            let options = EmbeddedPresentationOptions {
+                control_tool: "approve_remedy".to_string(),
+                supports_delegation: false,
+                include_display_plan: true,
+                yell_tool: None,
+            };
+            block_feedback(
+                &planned,
+                &[],
+                policy.engine().registry(),
+                &ReturnBounds {
+                    label: Label::top(),
+                    lowest: Trust::new(0),
+                },
+                ToolNaming::AsAuthored,
+                "send_mail",
+                &options,
+            )
+            .display
+            .expect("the display plan is requested")
+            .reasons
+        };
+        let without = reasons(None);
+        let impact = |restricted: usize, recipient_checked: &[&str]| {
+            Some(NarrowingImpact {
+                tools: 4,
+                sign_off: restricted,
+                blocked: 0,
+                recipient_checked: recipient_checked
+                    .iter()
+                    .map(|tool| appa_engine::value::ToolName::new(*tool))
+                    .collect(),
+            })
+        };
+        for (impact, added) in [
+            (impact(1, &[]), 1),
+            (impact(0, &["send_mail", "reply"]), 1),
+            (impact(1, &["send_mail"]), 2),
+        ] {
+            let with = reasons(impact.clone());
+            assert_eq!(with.len(), without.len() + added, "{impact:?}");
+            assert!(with.starts_with(&without));
+        }
+    }
+
+    #[test]
     fn embedded_presentation_uses_the_host_control_name_and_omits_delegation_advice() {
         let options = EmbeddedPresentationOptions {
             control_tool: "approve_remedy".to_string(),
             supports_delegation: false,
             include_display_plan: true,
+            yell_tool: None,
         };
         let planned = PlannedBlock {
             raw: RawBlock {
@@ -4962,6 +5379,7 @@ mod tests {
                 }],
             })],
             fork_advice: Some(super::ForkAdvice::SameLabel),
+            narrowing_impact: None,
         };
         let policy = appa_policy::Config::from_toml_str("version = 2").expect("the policy compiles");
         let feedback = block_feedback(
@@ -4990,6 +5408,47 @@ mod tests {
         let display = feedback.display.expect("the opt-in carries a typed display plan");
         assert_eq!(display.plans[0].offer_id, "0123456789abcdef");
         assert_eq!(display.plans[0].text, "Submit for approval");
+    }
+
+    #[test]
+    fn a_host_reporting_tool_ends_the_block_with_a_report_section() {
+        let planned = PlannedBlock {
+            raw: RawBlock {
+                requirement_gaps: vec![],
+                narrowing: None,
+            },
+            plans: vec![],
+            fork_advice: Some(super::ForkAdvice::SameLabel),
+            narrowing_impact: None,
+        };
+        let policy = appa_policy::Config::from_toml_str("version = 2").expect("the policy compiles");
+        let render = |yell_tool: Option<&str>| {
+            block_feedback(
+                &planned,
+                &[],
+                policy.engine().registry(),
+                &ReturnBounds {
+                    label: appa_engine::label::Label::top(),
+                    lowest: Trust::new(0),
+                },
+                ToolNaming::AsAuthored,
+                "tool",
+                &EmbeddedPresentationOptions {
+                    yell_tool: yell_tool.map(str::to_string),
+                    ..EmbeddedPresentationOptions::default()
+                },
+            )
+            .text
+        };
+        let reporting = render(Some("archestra__yell"));
+        assert!(
+            reporting.ends_with(
+                "Report:\n  If a plan makes no sense, you keep getting blocked, the user keeps being asked to \
+                 approve similar calls, or the user is frustrated, call archestra__yell."
+            ),
+            "the Report section comes last and names the host's spelling: {reporting}"
+        );
+        assert!(!render(None).contains("Report:"));
     }
 
     #[test]
@@ -5023,6 +5482,7 @@ mod tests {
                 },
                 plans: vec![],
                 fork_advice: None,
+                narrowing_impact: None,
             };
             block_feedback(
                 &planned,
